@@ -1,0 +1,22 @@
+[package]
+name = "lab-02"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.90"
+
+[dev-dependencies]
+crossbeam-channel = "0.5"
+ntest = "0.9"
+
+[[bin]]
+name = "lab02"
+path = "main.rs"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# "Calling .clone() on an Rc, Arc, or Weak can obscure the fact that only the pointer is being cloned, not the underlying data."
+# Calling `Arc::clone` is therefore a preferred convention (e.g., see the Book).
+# This lint is not enabled by default as it produces too verbose suggestions.
+#clone_on_ref_ptr = "warn"

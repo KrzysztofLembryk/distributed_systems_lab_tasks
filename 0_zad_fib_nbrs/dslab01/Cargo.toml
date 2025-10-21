@@ -1,0 +1,26 @@
+[package]
+name = "lab-01"
+version = "0.2.1"
+edition = "2024"
+rust-version = "1.90"
+
+[dependencies]
+# This is a section for external dependencies. There is none in the first assignment.
+
+[dev-dependencies]
+# These dependecies are only available for tests.
+ntest = "0.9"
+
+[[bin]]
+name = "lab01"
+path = "main.rs"
+
+[lints.rust]
+# We can choose project-wide lints either in `main.rs/lib.rs` with `#![..]` syntax,
+# or in cargo under the `[lints]` scope.
+unsafe_code = "forbid"
+
+[lints.clippy]
+# You can enable extra clippy lints here.
+# For instance, enable the `pedantic` group to check your code against an opinionated set of lints.
+#pedantic = { level = "warn", priority = -1 }
