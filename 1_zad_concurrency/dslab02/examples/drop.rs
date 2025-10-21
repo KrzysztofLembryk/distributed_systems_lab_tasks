@@ -45,6 +45,12 @@ fn iterate_taking_ownership_of_elements_example() {
     let v2 = vec![Droppable { name: "a2" }, Droppable { name: "b2" }];
     let mut v3 = vec![Droppable { name: "a3" }, Droppable { name: "b3" }];
 
+    for droppable in &v1 {
+        // In every iteration the variable `droppable` takes ownership of a vector's
+        // element, and the element is dropped at the end of the iteration.
+        println!("{} we iterate over reference shoudn't be dropped", droppable.name);
+    }
+
     for droppable in v1 {
         // In every iteration the variable `droppable` takes ownership of a vector's
         // element, and the element is dropped at the end of the iteration.

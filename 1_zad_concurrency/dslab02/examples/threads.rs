@@ -23,13 +23,15 @@ fn panicking_thread() {
 fn moving_values_into_thread() {
     let mut v = vec![1, 2, 3, 4];
 
+    println!("old vec: {v:?}");
     // Not every value can be moved into another thread, only these which are `Send`.
     // Most types are `Send`, but some are not (e.g., raw pointers and `Rc`).
     let thread = spawn(move || {
         v.push(5);
         println!("{v:?}");
         // A thread can also return a `Send` value
-        v.into_boxed_slice()
+        // v.into_boxed_slice()
+        v 
     });
     let new_v = thread.join().unwrap();
     println!("{new_v:?}");

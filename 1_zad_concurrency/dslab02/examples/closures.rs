@@ -11,7 +11,7 @@ fn closure_environment() {
     let vec = vec![1, 2, 3, 4, 5, 6];
 
     // The closure used below to filter the vector captures its environment:
-    // an immutable reference to `allowed_numbers` is passed into the closure.
+    // AN IMMUTABLE REFERENCE to `allowed_numbers` is passed into the closure.
     // This is the default way the capturing of the environment works. Note that
     // the closure cannot outlive any of the borrowed references, the same as
     // any value in Rust:
