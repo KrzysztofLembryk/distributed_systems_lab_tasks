@@ -1,0 +1,22 @@
+[package]
+name = "lab-03"
+version = "0.4.0"
+edition = "2024"
+
+[dependencies]
+# This is how we add dependencies to our projects.
+# There could be also optional dependencies for fine-grained conditional compilation.
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+# These dependecies are only available, when the code is gated with `#[cfg(test)]`.
+ntest = "0.9.3"
+
+[[bin]]
+name = "lab03"
+path = "main.rs"
+
+[lints.rust]
+# We can choose project-wide lints either in `main.rs/lib.rs` with `#![..]` syntax,
+# or in cargo under the `[lints]` scope.
+unsafe_code = "forbid"
