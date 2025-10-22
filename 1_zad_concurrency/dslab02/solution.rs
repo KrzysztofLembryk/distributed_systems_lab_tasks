@@ -65,12 +65,13 @@ impl Threadpool {
 
         // We take mutex. If success, in guard we have our queue of tasks
         let mut guard = lock.lock().unwrap();
-
+        
+        // we save the task
         guard.push(task);
 
         // As in shared_memory example we wake up all threads waiting on cond.
         cond.notify_all();
-    }
+    } // mutex freed herer
 
     // We suggest extracting the implementation of the worker to an associated
     // function, like this one (however, it is not a part of the public
