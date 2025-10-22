@@ -18,8 +18,6 @@ pub struct Threadpool {
     // we also need condVar since idea is thread will be waiting for our 
     // task vector to be not empty and if it is not empty there is a task that
     // should be done
-    // To prevent race conditions in the same mutex we store bool that says 
-    // if we are shutting down
     tasks_queue: Arc<(Mutex<(Vec<Task>, bool)>, Condvar)>,
 
     // we want to store thread handles so we can wait for them and join them
