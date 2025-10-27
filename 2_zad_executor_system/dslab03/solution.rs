@@ -1,6 +1,9 @@
 // WARNING: Do not modify definitions of public types or function names in this
 // file – your solution will be tested automatically! Implement all missing parts.
 
+use core::panic;
+use std::collections::HashMap;
+
 use crate::definitions::{
     Ident, Message, MessageHandler, Module, ModuleMessage, Num, SystemMessage,
 };
@@ -46,7 +49,18 @@ impl DividerModule {
         // It represents the idea that modules refer to each other
         // by sending messages at an address.
         let id = Ident::new();
-        unimplemented!("Register");
+        // we clone queue so that we can use it after we move ownership
+        let register_tx = queue.clone();
+        let new_div_mod = DividerModule{
+            id: id, // id is copied (Ident has Copy trait)
+            other: None, // we don't have other yet
+            queue: queue // queue is moved 
+        };
+        
+        register_tx.send(Message::System(
+                SystemMessage::RegisterModule(
+                    Module::Divider(new_div_mod)))).expect("DividerModule - create - send failed");
+
         id
     }
 }
@@ -64,17 +78,36 @@ impl MessageHandler for DividerModule {
     /// or the computation is stopped.
     /// Remember to make the module send messages to itself,
     /// rather than recursively invoking methods of the module.
+    /// - `idx` is the current index in the sequence.
     fn compute_step(&mut self, idx: usize, num: Num) {
         assert!(num.is_multiple_of(2));
 
-        unimplemented!("Process");
+        let num = num / 2;
+        let idx = idx + 1;
+
+        if num.is_multiple_of(2)
+        {
+            self.queue.send(Message::ToModule(
+                self.id,  
+                ModuleMessage::ComputeStep { idx: idx, num: num }))
+                .unwrap();
+        } 
+        else 
+        {
+            self.queue.send(Message::ToModule(
+                self.other.expect("compute_step - DividerModule - other = None"),  
+                ModuleMessage::ComputeStep { idx: idx, num: num }))
+                .unwrap();
+        }
+
+        // unimplemented!("Process");
     }
 
     /// Handle the init message.
     ///
     /// The module finishes its initialization.
     fn init(&mut self, other: Ident) {
-        unimplemented!("Process");
+        self.other  = Some(other)
     }
 }
 
@@ -83,7 +116,20 @@ impl MultiplierModule {
     pub(crate) fn create(some_num: Num, queue: Sender<Message>) -> Ident {
         // The identifier is an opaque number for your code!
         let id = Ident::new();
-        unimplemented!("Register");
+
+        // we clone queue so that we can use it after we move ownership
+        let register_tx = queue.clone();
+        let new_mult_mod = MultiplierModule{
+            id: id, // id is copied (we have Copy trait in def)
+            other: None, // we don't have other yet
+            queue: queue, // queue is moved 
+            num: some_num // some_num is copied (Num is u64) 
+        };
+        
+        register_tx.send(Message::System(
+                SystemMessage::RegisterModule(
+                    Module::Multiplier(new_mult_mod)))).unwrap();
+
         id
     }
 }
@@ -99,17 +145,60 @@ impl MessageHandler for MultiplierModule {
     /// or the computation is stopped.
     /// Remember to make the module send messages to itself,
     /// rather than recursively invoking methods of the module.
-    fn compute_step(&mut self, idx: usize, num: Num) {
+    fn compute_step(&mut self, idx: usize, num: Num) 
+    {
         assert!(!num.is_multiple_of(2));
-        unimplemented!("Process");
+
+        if num == 1
+        {
+            self.queue.send(Message::System(SystemMessage::Exit(idx))).expect("MultiplierModule - compute_step - num == 1 - send error");
+        }
+        else 
+        {
+            let num = 3 * num + 1;
+            let idx = idx + 1;
+
+            if num.is_multiple_of(2)
+            {
+                self.queue.send(Message::ToModule(
+                    self.other.expect("compute_step - DividerModule - other = None"),  
+                    ModuleMessage::ComputeStep { idx: idx, num: num }))
+                    .unwrap();
+            } 
+            else 
+            {
+                self.queue.send(Message::ToModule(
+                    self.id,  
+                    ModuleMessage::ComputeStep { idx: idx, num: num }))
+                    .unwrap();
+            }
+            
+        }
     }
 
     /// Handle the init message.
     ///
     /// The module finishes its initialization and starts the computation
     /// by sending a message.
-    fn init(&mut self, other: Ident) {
-        unimplemented!("Process");
+    fn init(&mut self, other: Ident) 
+    {
+        self.other = Some(other);
+        let idx = 1;
+
+        if self.num.is_multiple_of(2)
+        {
+            self.queue.send(Message::ToModule(
+                self.other.expect("init - MultModule - other = None"),  
+                ModuleMessage::ComputeStep { idx: idx, num: self.num }))
+                .unwrap();
+        } 
+        else 
+        {
+            self.queue.send(Message::ToModule(
+                self.id,
+                ModuleMessage::ComputeStep { idx: idx, num: self.num }))
+                .unwrap();
+        }
     }
 }
 
@@ -124,10 +213,54 @@ impl MessageHandler for MultiplierModule {
 /// The system returns the value found in the `Exit` message
 /// or `None` if there are no more messages to process.
 pub(crate) fn run_executor(rx: Receiver<Message>) -> JoinHandle<Option<usize>> {
-    unimplemented!();
     thread::spawn(move || {
-        while let Ok(msg) = rx.recv() {
-            unimplemented!("Handle");
+
+        // W store hash map where:
+        // --> keys = module Ident, 
+        // --> values = tuple of Module and bool, where bool remembers if module was initialized
+        let mut modules_map: HashMap<Ident, (Module, bool)> = HashMap::new();
+
+        while let Ok(msg) = rx.recv() 
+        {
+            match msg 
+            {
+                Message::System(sys_msg) => {
+                    match sys_msg 
+                    {
+                        SystemMessage::RegisterModule(module) => {
+                            modules_map.insert(module.get_id(), (module, false));
+                        },
+                        SystemMessage::Exit(collatz_res) => {
+                            return Some(collatz_res);
+                        }
+                    }
+                },
+                Message::ToModule(mod_id, mod_msg) => {
+                    let (module, is_initialized) = modules_map.get_mut(&mod_id).expect("given module id is not in modules map in executor");
+
+                    match mod_msg
+                    {
+                        ModuleMessage::Init{other} => {
+                            if !*is_initialized
+                            {
+                                *is_initialized = true;
+                                module.init(other);
+                            }
+                            else  
+                            {
+                                panic!("Module '{mod_id:?}' is being initialized for the second time!");     
+                            }
+                        },
+                        ModuleMessage::ComputeStep { idx, num } => {
+                            if !*is_initialized
+                            {
+                                panic!("Trying to compute step on module {mod_id:?} which is NOT initialized!!");
+                            } 
+                            module.compute_step(idx, num);
+                        }
+                    }
+                }
+            }
         }
         // No more messages in the system
         None
@@ -146,8 +279,16 @@ pub(crate) fn collatz(n: Num) -> usize {
     let multiplier = MultiplierModule::create(n, tx.clone());
 
     // Initialize the modules by sending `Init` messages:
-    unimplemented!();
+    // unimplemented!();
+    send_init_to_modules(divider, multiplier, &tx);
 
     // Run the executor:
     run_executor(rx).join().unwrap().unwrap()
+}
+
+fn send_init_to_modules(div_id: Ident, mult_id: Ident, tx: &Sender<Message>)
+{
+    tx.send(Message::ToModule(div_id, ModuleMessage::Init { other: mult_id })).expect("send_init_to_modules - tx.send div_id encountered error");
+
+    tx.send(Message::ToModule(mult_id, ModuleMessage::Init { other: div_id })).expect("send_init_to_modules - tx.send mult_id encountered error");
 }
