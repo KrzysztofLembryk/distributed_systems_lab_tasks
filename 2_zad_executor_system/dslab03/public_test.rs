@@ -12,6 +12,20 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn collatz_panics_on_zero()
+    {
+        collatz(0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn collatz_panics_on_overflow()
+    {
+        collatz(6_446_744_073_709_551_615);
+    }
+
+    #[test]
     fn modules_are_unit_testable() {
         let (tx, rx) = unbounded();
         MultiplierModule::create(17, tx.clone());

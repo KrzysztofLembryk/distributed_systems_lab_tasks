@@ -155,7 +155,9 @@ impl MessageHandler for MultiplierModule {
         }
         else 
         {
-            let num = 3 * num + 1;
+            let num = num.checked_mul(3)
+                        .and_then(|n| n.checked_add(1))
+                        .expect("Overflow in Collatz computation: 3x+1 exceeds max of u64"); 
             let idx = idx + 1;
 
             if num.is_multiple_of(2)
@@ -273,6 +275,10 @@ pub(crate) fn run_executor(rx: Receiver<Message>) -> JoinHandle<Option<usize>> {
 ///
 /// PS, this function is known to stop for every possible u64 value :).
 pub(crate) fn collatz(n: Num) -> usize {
+    if n == 0
+    {
+        panic!("collatz function was invoked with num == 0");
+    }
     // Create the queue and two modules:
     let (tx, rx): (Sender<Message>, Receiver<Message>) = unbounded();
     let divider = DividerModule::create(tx.clone());
