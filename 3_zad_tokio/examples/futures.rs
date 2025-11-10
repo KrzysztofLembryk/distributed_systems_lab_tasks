@@ -1,5 +1,8 @@
 #![allow(clippy::manual_async_fn, clippy::unused_async)]
 
+use std::time::Duration;
+
+use tokio::time::{sleep};
 use futures::future::{join, join_all, ready};
 use futures::{FutureExt, TryFutureExt};
 
@@ -155,11 +158,11 @@ fn run_asynchronous_actions() {
 }
 
 fn main() {
-    simple_future();
-    futures_combining();
-    futures_joining();
-    async_block();
-    await_example();
-    run_async_function();
+    // simple_future();
+    // futures_combining();
+    // futures_joining();
+    // async_block();
+    // await_example();
+    // run_async_function();
     run_asynchronous_actions();
 }

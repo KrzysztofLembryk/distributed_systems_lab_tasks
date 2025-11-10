@@ -20,6 +20,26 @@ impl Handler<u8> for CountToFive {
     }
 }
 
+
+#[tokio::test]
+// #[timeout(300)]
+async fn my_test() {
+    let mut system = System::new().await;
+    let (five_sender, mut five_receiver) = unbounded_channel::<u8>();
+    let count_to_five = system
+        .register_module(|self_ref| CountToFive {
+            self_ref,
+            five_sender,
+        })
+        .await;
+
+    count_to_five.send(1).await;
+
+    assert_eq!(five_receiver.recv().await.unwrap(), 5);
+
+    // system.shutdown().await;
+}
+
 #[tokio::test]
 #[timeout(300)]
 async fn self_ref_works() {

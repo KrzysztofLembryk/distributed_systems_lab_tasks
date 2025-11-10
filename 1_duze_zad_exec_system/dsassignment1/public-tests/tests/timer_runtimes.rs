@@ -71,6 +71,8 @@ async fn second_tick_arrives_after_correct_interval() {
     timeout_receiver.recv().await.unwrap();
     let elapsed = start_instant.elapsed();
 
+    println!("elapsed: {:?}", elapsed);
+    println!("timeout interval * 2 [milis]: {:?}", timeout_interval.as_millis());
     // Note: this bound may be too strict for some implementations,
     // but it likely indicates congestion.
     assert!((elapsed.as_millis() as i128 - (timeout_interval.as_millis() * 2) as i128).abs() <= 2);
