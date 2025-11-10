@@ -3,6 +3,8 @@ use std::io::Empty;
 use std::thread::JoinHandle;
 use tokio::sync::mpsc::{UnboundedSender, channel, unbounded_channel};
 use tokio::time::Duration;
+use tokio::sync::broadcast;
+use std::sync::{Arc, Weak};
 
 /// We define trait Message; any type that will Implement Message trait must
 /// also implement Send trait and have static lifetime
@@ -62,12 +64,9 @@ impl TimerHandle {
 #[non_exhaustive]
 pub struct System {
     // You can add fields to this struct (non_exhaustive makes it SemVer-compatible).
-    // - register_module returns ref to the module, 
-    // - Closure that we get as argument of register_module returns T: Module.
-    // - We will store original module T inside our system.
-    modules: Vec<Box<dyn Module>>,
     task_handles: Vec<tokio::task::JoinHandle<()>>,
-    shutdown_senders: Vec<UnboundedSender<()>>
+    shutdown_senders: Vec<UnboundedSender<()>>,
+    tx_arc_broadcast: Arc<broadcast::Sender<()>> 
 }
 
 impl System {
@@ -85,10 +84,12 @@ impl System {
         // channel for sending shutdown command to modules
         let (tx_shutdown, mut rx_shutdown)  = unbounded_channel::<()>();
         // We create ModuleRef and give it sender channel, so that we are able
-        // to communicate with tokio task using this ModuleRef
+        // to communicate with tokio task using this ModuleRef, and this task
+        // will receive msg and run models handler on it
         let mod_ref: ModuleRef<T> = ModuleRef{
             _marker: std::marker::PhantomData,
-            msg_sender: tx_msg.clone()
+            msg_sender: tx_msg.clone(),
+            broadcast_ref: self.tx_arc_broadcast.clone()
         };
 
         // Having created ModuleRef we can create module using closure
@@ -119,15 +120,21 @@ impl System {
 
     /// Creates and starts a new instance of the system.
     pub async fn new() -> Self {
+        // we will send only one message which will be shutdown
+        let (tx_broadcast, _) = broadcast::channel::<()>(2);
+        let arc_broadcast = Arc::new(tx_broadcast);
         System {
-            modules: Vec::new(),
             task_handles: Vec::new(),
-            shutdown_senders: Vec::new()
+            shutdown_senders: Vec::new(),
+            tx_arc_broadcast: arc_broadcast,
         }
     }
 
     /// Gracefully shuts the system down.
-    pub async fn shutdown(&mut self) {
+    pub async fn shutdown(&mut self) 
+    {
+        // we broadcast shutdown msg to Tick tasks
+        let _ = self.tx_arc_broadcast.send(());
 
         for sender in &self.shutdown_senders        
         {
@@ -163,7 +170,8 @@ where
     // We use the standard pattern to make our struct Send/Sync independent of `T`, but covariant.
     _marker: std::marker::PhantomData<fn() -> T>,
 
-    msg_sender: UnboundedSender<Box<dyn Handlee<T>>>
+    msg_sender: UnboundedSender<Box<dyn Handlee<T>>>,
+    broadcast_ref: Arc<broadcast::Sender<()>>,
 }
 
 impl<T: Module> ModuleRef<T> {
@@ -172,7 +180,9 @@ impl<T: Module> ModuleRef<T> {
     where
         T: Handler<M>,
     {
-        self.msg_sender.send(Box::new(msg)).unwrap();
+        // if System::shutdown was invoked and then someone uses send nothing
+        // happens and we ignore error (the same as in timeHandle::stop)
+        let _ = self.msg_sender.send(Box::new(msg));
     }
 
     /// Schedules a message to be sent to the module periodically with the given interval.
@@ -184,15 +194,18 @@ impl<T: Module> ModuleRef<T> {
         M: Message + Clone,
         T: Handler<M>,
     {
-        use tokio::sync::mpsc::error::TryRecvError;
-
         let mut interval = tokio::time::interval(delay);
+        // first tick is immediate so we want to skip it
+        interval.tick().await;
 
         // We clone module channel so that we can send msg to the module
         let tx_msg_cloned = self.msg_sender.clone();
 
+        // We subscribe to broadcast so that System::shutdown can stop us
+        let mut rx_broadcast = self.broadcast_ref.subscribe();
+
         // We create new channels so that we can stop ticks
-        let (tx_shutdown, mut rx_shutdown)  = unbounded_channel::<()>();
+        let (tx_shutdown, mut rx_shutdown) = unbounded_channel::<()>();
 
         // Since every call resulsts in sending new ticks without cancelling
         // previous ones, each time we will create a new tokio Task that will 
@@ -200,30 +213,20 @@ impl<T: Module> ModuleRef<T> {
         let _ = tokio::spawn(async move {
             loop  
             {
-                interval.tick().await;
-
-                // println!("Tick sleeping");
-                // tokio::time::sleep(delay).await;
-                // Right after the interval passes, we check if shutdown
-                // and break loop if it is, otherwise we send message
-                // println!("Tick matching");
-                match rx_shutdown.try_recv()
-                {
-                    Ok(_) => {println!("Tick Got shutdown"); break;},
-                    Err(_) => tx_msg_cloned
+                tokio::select! {
+                    biased;
+                    Some(_) = rx_shutdown.recv() => {
+                        break;
+                    },
+                    // if we get error we ignore it
+                    Ok(_) = rx_broadcast.recv() =>{break;},
+                    _ = interval.tick() => {
+                                    tx_msg_cloned
                                         .send(Box::new(message.clone()))
-                                        .unwrap()
-                    // Err(e) => match e {
-                    //     // If no shutdown msg we continue
-                    //     TryRecvError::Empty => (),
-                    //     // If channel closed it means that our TimerHandler
-                    //     // was dropped, but we didnt receive shutdown message
-                    //     // so we continue
-                    //     TryRecvError::Disconnected => ()
-                    //}
+                                        .unwrap();
+                    }
+
                 }
-                // println!("sending msg");
-                // tx_msg_cloned.send(Box::new(message.clone())).unwrap();
             }
         });
 
@@ -241,7 +244,8 @@ impl<T: Module> Clone for ModuleRef<T> {
     fn clone(&self) -> Self {
         ModuleRef { 
             _marker: std::marker::PhantomData, 
-            msg_sender: self.msg_sender.clone() 
+            msg_sender: self.msg_sender.clone(),
+            broadcast_ref: self.broadcast_ref.clone(),
         }
     }
 }

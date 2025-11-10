@@ -72,9 +72,11 @@ async fn second_tick_arrives_after_correct_interval() {
     let elapsed = start_instant.elapsed();
 
     println!("elapsed: {:?}", elapsed);
-    println!("timeout interval * 2 [milis]: {:?}", timeout_interval.as_millis());
+    println!("timeout interval * 2 [milis]: {:?}", timeout_interval.as_millis() * 2);
     // Note: this bound may be too strict for some implementations,
     // but it likely indicates congestion.
+    println!("diff: {}", (elapsed.as_millis() as i128 - (timeout_interval.as_millis() * 2) as i128).abs());
+
     assert!((elapsed.as_millis() as i128 - (timeout_interval.as_millis() * 2) as i128).abs() <= 2);
     sys.shutdown().await;
 }
