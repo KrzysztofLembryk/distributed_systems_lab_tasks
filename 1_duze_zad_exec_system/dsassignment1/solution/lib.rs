@@ -1,10 +1,8 @@
 use core::panic;
-use std::io::Empty;
-use std::thread::JoinHandle;
-use tokio::sync::mpsc::{UnboundedSender, channel, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio::time::Duration;
 use tokio::sync::broadcast;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc};
 
 /// We define trait Message; any type that will Implement Message trait must
 /// also implement Send trait and have static lifetime
@@ -49,6 +47,7 @@ impl<M: Message, T: Handler<M>> Handlee<T> for M {
 #[non_exhaustive]
 pub struct TimerHandle {
     // You can add fields to this struct (non_exhaustive makes it SemVer-compatible).
+    // will send messages to given module
     msg_sender: UnboundedSender<()>,
 }
 
@@ -81,11 +80,15 @@ impl System {
     {
         // channel for sending messages to modules
         let (tx_msg, mut rx_msg)  = unbounded_channel::<Box<dyn Handlee<T>>>();
+
         // channel for sending shutdown command to modules
         let (tx_shutdown, mut rx_shutdown)  = unbounded_channel::<()>();
+
         // We create ModuleRef and give it sender channel, so that we are able
         // to communicate with tokio task using this ModuleRef, and this task
         // will receive msg and run models handler on it
+        // We also give it a reference to broadcast channel so that Tick tasks
+        // can subscribe to it, and System::shutdown can end them.
         let mod_ref: ModuleRef<T> = ModuleRef{
             _marker: std::marker::PhantomData,
             msg_sender: tx_msg.clone(),
@@ -121,7 +124,7 @@ impl System {
     /// Creates and starts a new instance of the system.
     pub async fn new() -> Self {
         // we will send only one message which will be shutdown
-        let (tx_broadcast, _) = broadcast::channel::<()>(2);
+        let (tx_broadcast, _) = broadcast::channel::<()>(1);
         let arc_broadcast = Arc::new(tx_broadcast);
         System {
             task_handles: Vec::new(),
@@ -180,7 +183,7 @@ impl<T: Module> ModuleRef<T> {
     where
         T: Handler<M>,
     {
-        // if System::shutdown was invoked and then someone uses send nothing
+        // if System::shutdown was invoked and then someone uses send, nothing
         // happens and we ignore error (the same as in timeHandle::stop)
         let _ = self.msg_sender.send(Box::new(msg));
     }
