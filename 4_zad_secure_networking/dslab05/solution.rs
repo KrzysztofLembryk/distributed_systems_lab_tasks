@@ -1,12 +1,10 @@
-use rustls::{ClientConnection, RootCertStore, pki_types::{ServerName, pem::PemObject}};
+use rustls::{ClientConnection, RootCertStore, ServerConnection, StreamOwned, pki_types::{CertificateDer, ServerName, pem::PemObject}};
 use std::{io::{Read, Write}, sync::Arc};
 // You can add here other imports from std or crates listed in Cargo.toml.
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use crate::certs;
 // The below `PhantomData` marker is here only to suppress the "unused type
 // parameter" error. Remove it when you implement your solution:
-use std::marker::PhantomData;
 
 type HmacSha256 = Hmac<Sha256>;
 pub struct SecureClient<L: Read + Write> {
@@ -17,22 +15,8 @@ pub struct SecureClient<L: Read + Write> {
 
 pub struct SecureServer<L: Read + Write> {
     // Add here any fields you need.
-    phantom: PhantomData<L>,
-}
-
-struct MsgFormat
-{
-    len: u32,
-    content: Vec<u8>,
-    hmac: HmacSha256
-}
-
-impl MsgFormat
-{
-    pub fn new(data: &Vec<u8>)
-    {
-
-    }
+    mac: HmacSha256,
+    tls_stream: rustls::StreamOwned<ServerConnection, L>
 }
 
 impl<L: Read + Write> SecureClient<L> {
@@ -109,15 +93,82 @@ impl<L: Read + Write> SecureServer<L> {
         hmac_key: &[u8],
         server_private_key: &str,
         server_full_chain: &str,
-    ) -> Self {
-        unimplemented!()
+    ) -> Self 
+    {
+        let mac = HmacSha256::new_from_slice(hmac_key).unwrap();
+
+        // Load the certificate chain for the server:
+        let certs_chain: Vec<CertificateDer> =    rustls::pki_types::CertificateDer::pem_slice_iter(
+                server_full_chain.as_bytes())
+                .flatten()
+                .collect();
+            
+        let private_key = rustls::pki_types::PrivateKeyDer
+            ::from_pem_slice(server_private_key.as_bytes())
+            .unwrap();
+        
+        let server_config = rustls::ServerConfig::builder()
+                            .with_no_client_auth()
+                            .with_single_cert(certs_chain, private_key)
+                            .unwrap();
+
+        let connection = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+
+        SecureServer { 
+            mac: mac,            
+            tls_stream: StreamOwned::new(connection, link)
+        }
     }
 
     /// Receives the next incoming message and returns the message's content
     /// (i.e., without the message size and without the HMAC tag) if the
     /// message's HMAC tag is correct. Otherwise, returns `SecureServerError`.
-    pub fn recv_message(&mut self) -> Result<Vec<u8>, SecureServerError> {
-        unimplemented!()
+    pub fn recv_message(&mut self) -> Result<Vec<u8>, SecureServerError> 
+    {
+        // Firstly we want to read size of data so that we can create big enough
+        // buffer for this data
+        let mut data_size = vec![0; 4];
+
+        // read_exact will return error if it reads less than buff size
+        self.tls_stream.read_exact(&mut data_size).unwrap();
+
+        let data_size = u32::from_be_bytes(data_size[..].try_into().unwrap());
+
+        // We read main data
+        let mut buf = vec![0; data_size as usize];
+
+        self.tls_stream.read_exact(&mut buf).unwrap();
+
+        // We know mac is 32 bytes
+        let mut tag_buf = vec![0; 32];
+
+        self.tls_stream.read_exact(&mut tag_buf).unwrap();
+
+        self.verify_hmac(&buf, &tag_buf.try_into().unwrap())?;
+
+        Ok(buf)
+    }
+
+    fn verify_hmac(
+        &self, 
+        data: &Vec<u8>, 
+        tag_buf: &[u8; 32]
+    ) -> Result<(), SecureServerError>
+    {
+        let mut mac = self.mac.clone();
+
+        // Calculate MAC for the data:
+        mac.update(data);
+
+        // Verify the tag:
+        if mac.verify_slice(tag_buf).is_ok()
+        {
+            Ok(())
+        }
+        else 
+        {
+            Err(SecureServerError::InvalidHmac)
+        }
     }
 }
 
