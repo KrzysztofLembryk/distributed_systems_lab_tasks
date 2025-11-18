@@ -40,7 +40,7 @@ impl Storage
             {
                 match self.check_tmp_file(file_name, file_path).await
                 {
-                    Err(e) => println!("ERROR: In recover file: {}, got: {}", file_name, e),
+                    Err(_) => (), // this means we got incorrect checksum
                     _ => ()
                 }
             }
@@ -176,7 +176,6 @@ impl StableStorage for Storage
 {
     async fn put(&mut self, key: &str, value: &[u8]) -> Result<(), String>
     {
-        // TODO: maybe we should HASH tmp files, since when we get key with len 255 we get error since tmp_key is greater than 255
         if key.len() > KEY_MAX_SIZE
         {
             return Err(format!("Provided key: '{}' ({} bytes) is longer than allowed 255 bytes", key, key.len()));
@@ -190,31 +189,39 @@ impl StableStorage for Storage
             return Err(format!("Provided value has '{}' bytes, we do not allow to store empty value ", value.len()));
         }
 
-        let tmp_file_name = format!("{}{}", TMP_PREFIX, key);
+        // key can be anything, thus can also contain characters not allowed as
+        // file name, therefore we firstly hash key, and will use this hash to 
+        // create a file name with always fixed size and correct characters 
+        let key_hash = Sha256::digest(key.as_bytes());
+        let key_hash_str = format!("{:x}", key_hash);
+
+        let tmp_file_name = format!("{}{}", TMP_PREFIX, key_hash_str);
         let tmp_file_path = self.root_dir.join(&tmp_file_name);
 
-        let hash = Sha256::digest(value);
+        let value_hash = Sha256::digest(value);
         let mut data_with_hash: Vec<u8> = Vec::with_capacity(HASH_SIZE + value.len());
 
-        data_with_hash.extend_from_slice(hash.as_slice());
+        data_with_hash.extend_from_slice(value_hash.as_slice());
         data_with_hash.extend_from_slice(value);
 
         // Now we can save tmp file to the disk
         self.save_data_to_file(&data_with_hash, &tmp_file_path).await;
 
-        let dest_file_path = self.root_dir.join(key);
+        let dest_file_path = self.root_dir.join(&key_hash_str);
 
         self.save_data_to_file(value, &dest_file_path).await;
         self.remove_file(&tmp_file_path).await;
-
-        self.file_keys.insert(key.to_string(), dest_file_path);
+        self.file_keys.insert(key_hash_str, dest_file_path);
 
         Ok(())
     }
 
     async fn get(&self, key: &str) -> Option<Vec<u8>>
     {
-        if let Some(path) = self.file_keys.get(key)
+        let key_hash = Sha256::digest(key.as_bytes());
+        let key_hash_str = format!("{:x}", key_hash);
+
+        if let Some(path) = self.file_keys.get(&key_hash_str)
         {
             return Some(self.read_file_data(path).await);
         }
@@ -223,13 +230,16 @@ impl StableStorage for Storage
 
     async fn remove(&mut self, key: &str) -> bool
     {
-        if let Some(path) = self.file_keys.get(key)
+        let key_hash = Sha256::digest(key.as_bytes());
+        let key_hash_str = format!("{:x}", key_hash);
+
+        if let Some(path) = self.file_keys.get(&key_hash_str)
         {
             // So that we dont have problem we mutable immutable ref
             let path_clone = path.clone();
 
             // We need to remember to also remove keys from map
-            self.file_keys.remove(key);
+            self.file_keys.remove(&key_hash_str);
             self.remove_file(&path_clone).await;
 
             return true;
@@ -301,11 +311,7 @@ async fn find_file_paths_and_names(
                                         .file_name()
                                         .and_then(|s| s.to_str())
             {
-                let start_with_tmp = file_name.starts_with(TMP_PREFIX);
-
-                // 4 here is len of 'tmp_'
-                if (start_with_tmp && file_name.len() > KEY_MAX_SIZE + 4)
-                    || (!start_with_tmp && file_name.len() > KEY_MAX_SIZE)
+                if file_name.len() > KEY_MAX_SIZE
                 {
                     return Err(std::io::Error::new(
                         ErrorKind::InvalidFilename, 

@@ -55,10 +55,10 @@ mod tests {
 
 
         storage
-            .put(&"k".repeat(251), vec![1_u8; 65535].as_slice())
+            .put(&"k".repeat(255), vec![1_u8; 65535].as_slice())
             .await.unwrap();
 
-        assert_eq!(storage.get(&"k".repeat(251)).await.unwrap(), vec![1_u8; 65535]);
+        assert_eq!(storage.get(&"k".repeat(255)).await.unwrap(), vec![1_u8; 65535]);
     }
 
     #[tokio::test]
