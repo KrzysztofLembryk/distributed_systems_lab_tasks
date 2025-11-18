@@ -1,6 +1,6 @@
-use std::{ffi::OsStr, path::PathBuf};
+use std::{path::PathBuf};
 use tokio::fs as t_fs;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use sha2::{Sha256, Digest};
 use std::io::ErrorKind;
 // You can add here other imports from std or crates listed in Cargo.toml.
@@ -16,7 +16,6 @@ struct Storage
 {
     root_dir: PathBuf,
     file_keys: HashMap<String, PathBuf>,
-    value: [u8; BUF_SIZE]
 }
 
 impl Storage
@@ -26,7 +25,6 @@ impl Storage
         Storage{
             root_dir: dst_dir,
             file_keys: keys,
-            value: [0; BUF_SIZE]
         }
     }
 
@@ -96,10 +94,11 @@ impl Storage
         let dest_file_name = tmp_file_name.strip_prefix(TMP_PREFIX).unwrap();
         let dest_path = self.root_dir.join(dest_file_name);
 
+        self.save_data_to_file(file_data, &dest_path).await;
+        self.remove_file(tmp_file_path).await;
+
         self.file_keys.remove(tmp_file_name);
         self.file_keys.insert(dest_file_name.to_string(), dest_path.clone());
-
-        self.save_data_to_file(file_data, &dest_path).await;
 
         Ok(())
     }
@@ -177,6 +176,7 @@ impl StableStorage for Storage
 {
     async fn put(&mut self, key: &str, value: &[u8]) -> Result<(), String>
     {
+        // TODO: maybe we should HASH tmp files, since when we get key with len 255 we get error since tmp_key is greater than 255
         if key.len() > KEY_MAX_SIZE
         {
             return Err(format!("Provided key: '{}' ({} bytes) is longer than allowed 255 bytes", key, key.len()));
@@ -296,8 +296,6 @@ async fn find_file_paths_and_names(
 
         if meta.is_file() 
         {
-            println!("entry_path: {:?}", entry_path);
-
             // if file path ends with '.' or '..' it returns None 
             if let Some(file_name) = entry_path
                                         .file_name()
