@@ -25,7 +25,6 @@ mod tests {
         assert_eq!(storage.get("key").await.unwrap(), vec![1_u8, 2, 3]);
     }
 
-
     #[tokio::test]
     #[timeout(500)]
     async fn my_test() {

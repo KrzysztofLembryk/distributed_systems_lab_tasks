@@ -188,7 +188,7 @@ impl StableStorage for Storage
         {
             return Err(format!("Provided value: '{}' bytes is longer than allowed {} bytes", value.len(), BUF_SIZE));
         }
-        if value.is_empty()
+        if value.len() == 0
         {
             return Err(format!("Provided value has '{}' bytes, we do not allow to store empty value ", value.len()));
         }
