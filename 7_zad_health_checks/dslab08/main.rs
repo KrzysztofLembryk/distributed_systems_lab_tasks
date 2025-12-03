@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use module_system::System;
 
+
 fn unwrap_alive_info(alive_info: DetectorOperation) -> HashSet<Uuid> {
     match alive_info {
         DetectorOperation::AliveInfo(alive) => alive,

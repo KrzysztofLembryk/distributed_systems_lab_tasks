@@ -11,7 +11,7 @@ bytes = "1.11"
 uuid = { version = "1.18", features = ["v4", "serde"] }
 async-trait = "0.1"
 log = "0.4"
-module_system = { path = "../la1/solution/", package = "assignment-1-solution" }
+module_system = { path = "../solution/", package = "assignment-1-solution" }
 
 [dev-dependencies]
 ntest = "0.9"

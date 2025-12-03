@@ -29,6 +29,20 @@ pub struct FailureDetectorModule {
     delay: Duration,
     self_ref: ModuleRef<Self>,
     // TODO add whatever fields necessary.
+
+    // We need to know our id
+    id: Uuid,
+    // We are required to send msgs via UDP thus we need a socket to do that
+    socket: Arc<UdpSocket>,
+    // We need to know all other processes addresses to be able to send 
+    // i.e. HeartBeatRequest to all of them
+    all_procs: HashMap<Uuid, SocketAddr>,
+    // Set of alive processes, at first all processes are alive
+    alive: HashSet<Uuid>,
+    // alive processes in previous tick
+    prev_interval_alive: HashSet<Uuid>,
+    // Set of suspected processes, at first is empty
+    suspected: HashSet<Uuid>,
 }
 
 impl FailureDetectorModule {
@@ -40,7 +54,8 @@ impl FailureDetectorModule {
     ) -> ModuleRef<Self> {
         let addr = addresses.get(&ident).unwrap();
         let socket = Arc::new(UdpSocket::bind(addr).await.unwrap());
-
+        let alive: HashSet<Uuid> = addresses.keys().copied().collect();
+        let prev_interval_alive = alive.clone();
         let module_ref = system
             .register_module(|self_ref| Self {
                 enabled: true,
@@ -49,6 +64,12 @@ impl FailureDetectorModule {
                 delay: delta,
                 self_ref,
                 // TODO initialize the fields you added
+                socket: socket.clone(),
+                all_procs: addresses.clone(),
+                id: ident.clone(),
+                alive: alive,
+                prev_interval_alive: prev_interval_alive,
+                suspected: HashSet::new(),
             })
             .await;
 
@@ -74,10 +95,50 @@ impl Handler<DetectorOperationUdp> for FailureDetectorModule {
     async fn handle(&mut self, msg: DetectorOperationUdp) {
         if self.enabled {
             let DetectorOperationUdp(operation, reply_addr) = msg;
-            unimplemented!(
-                "Process received UDP messages as in the algorithm.\
-                 Requests should be replied over UDP."
-            );
+
+            match operation
+            {
+                DetectorOperation::HeartbeatRequest => {
+                    // We got request for Heartbeat, so we send it via our UDP
+                    // socket to the reply_addr with our id
+                    self.socket
+                        .send_to(
+                            bincode::serde::encode_to_vec(
+                                &DetectorOperation::HeartbeatResponse(self.id), standard())
+                                .unwrap()
+                                .as_slice(),
+                            &reply_addr,
+                        )
+                        .await
+                        .expect("cannot send?");
+                },
+                DetectorOperation::HeartbeatResponse(proc_id) => {
+                    // When we received heartbeat response, we add given proc 
+                    // to alive set
+                    self.alive.insert(proc_id);
+                },
+                DetectorOperation::AliveRequest => {
+                    let prev_alive = self.prev_interval_alive.clone();
+                    self.socket
+                        .send_to(
+                            bincode::serde::encode_to_vec(
+                                &DetectorOperation::AliveInfo(prev_alive), 
+                                standard()
+                            ).unwrap().as_slice(),
+                            &reply_addr,
+                        )
+                        .await
+                        .expect("cannot send?");
+                },
+                DetectorOperation::AliveInfo(_alive_proc_set) => {
+                    // Nothing in the assignment description specified that anything should be done here 
+                },
+            }
+
+            // unimplemented!(
+            //     "Process received UDP messages as in the algorithm.\
+            //      Requests should be replied over UDP."
+            // );
         }
     }
 }
@@ -87,7 +148,54 @@ impl Handler<DetectorOperationUdp> for FailureDetectorModule {
 impl Handler<Timeout> for FailureDetectorModule {
     async fn handle(&mut self, _msg: Timeout) {
         if self.enabled {
-            unimplemented!("Implement the timeout logic.");
+            // unimplemented!("Implement the timeout logic.");
+
+            // We need to always stop our timer, and create a new one with 
+            // probably updated delay, we stop it first so that it won't send
+            // another msg
+            if let Some(t_handle) = &self.timeout_handle
+            {
+                t_handle.stop().await;
+            }
+
+            if !self.alive.is_disjoint(&self.suspected) 
+            {
+                // As in algorithm from lecture, if alive and suspected are not
+                // disjoint we increase delay by delta
+                self.delay += self.delta;
+            }
+
+            // We implement algorithm from slides
+            for (proc_id, proc_addr) in &self.all_procs
+            {
+                let is_alive = self.alive.contains(proc_id);
+                let is_suspected = self.suspected.contains(proc_id);
+
+                if !is_alive && !is_suspected
+                {
+                    self.suspected.insert(*proc_id);
+                }
+                else if is_alive && is_suspected
+                {
+                    self.suspected.remove(proc_id);
+                }
+
+                self.socket
+                    .send_to(
+                        bincode::serde::encode_to_vec(
+                            &DetectorOperation::HeartbeatRequest, standard())
+                            .unwrap()
+                            .as_slice(),
+                        proc_addr,
+                    )
+                    .await
+                    .expect("cannot send?");
+            }
+
+            self.prev_interval_alive = self.alive.clone();
+            self.alive = HashSet::new();
+            // We create new timer with possibly new delay
+            self.timeout_handle = Some(self.self_ref.request_tick(Timeout, self.delay).await);
         }
     }
 }
