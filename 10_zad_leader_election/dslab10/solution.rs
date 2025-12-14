@@ -1,6 +1,6 @@
 use log::info;
 use module_system::{Handler, ModuleRef, System, TimerHandle};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashSet};
 use tokio::time::Duration;
 use uuid::Uuid;
 
@@ -253,31 +253,12 @@ impl Raft {
                 }
             }
             ProcessType::Candidate { .. } => {
-                // if we are a candidate and got request vote from other 
-                // candidate, and this candidate's term is geq than ours, we 
-                // recognize him, vote for him and change to his Follower
-                if candidate_term >= self.state.current_term
-                {
-                    self.process_type = ProcessType::Follower;
-                    content = RaftMessageContent::RequestVoteResponse { 
-                            granted: true, 
-                            source: self.config.self_id 
-                    };
-                    // We reset timer and wait for new leader hearbeat
-                    // So we basically give this candidate time to gather votes
-                    self.reset_timer(self.config.election_timeout).await;
-                }
-                else
-                {
-                    // if his term is smaller we do not vote for him, and we are
-                    // still a candidate
-                    content = RaftMessageContent::RequestVoteResponse { 
-                            granted: false, 
-                            source: self.config.self_id 
-                    };
-                    // We do not reset timer, since we wait for timeout to count
-                    // our votes
-                }
+                // from visualisation recommended in task description
+                // we can see that candidate rejects other candidates requests
+                content = RaftMessageContent::RequestVoteResponse { 
+                        granted: false, 
+                        source: self.config.self_id 
+                };
             }
             ProcessType::Leader => {
                 info!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
@@ -318,6 +299,16 @@ impl Raft {
                 {
                     info!("Candidate: '{}' got vote from: '{}'", self.config.self_id, source);
                     votes_received.insert(source);
+
+                    // When we get majority we immediately become leader, reset timer and start our  leadership by sending heartbeats
+                    if votes_received.len() > self.config.processes_count / 2
+                    {
+                        self.process_type = ProcessType::Leader;
+                        self.state.leader_id = Some(self.config.self_id);
+                        self.update_state();
+                        self.broadcast_heartbeat().await;
+                        self.reset_timer(self.config.election_timeout / N_HEARTBEATS_DURING_TIMEOUT).await;
+                    }
                 }
             }
             ProcessType::Leader => {
