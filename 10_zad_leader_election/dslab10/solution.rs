@@ -264,6 +264,9 @@ impl Raft {
                 info!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
                 RequestVoteResponse, leader ignores this msg, probably some process died and revived after leader sent heartbeats", 
                 self.config.self_id, self.state.current_term);
+                // If we are here this means current candidate doesn't have term
+                // greater than this leader, so we reject since leader has voted
+                // for himself when he became a leader
                 content = RaftMessageContent::RequestVoteResponse { 
                     granted: false, 
                     source: self.config.self_id 
@@ -303,6 +306,9 @@ impl Raft {
                     // When we get majority we immediately become leader, reset timer and start our  leadership by sending heartbeats
                     if votes_received.len() > self.config.processes_count / 2
                     {
+                        info!("Candidate: '{}' has become a LEADER", 
+                            self.config.self_id);
+
                         self.process_type = ProcessType::Leader;
                         self.state.leader_id = Some(self.config.self_id);
                         self.update_state();
@@ -313,7 +319,7 @@ impl Raft {
             }
             ProcessType::Leader => {
                 info!("handle_request_vote_response:: Process: '{}' that is a leader during term: '{}' got 
-                RequestVoteResponse, leader ignores this msg, probably some process died and revived after leader sent heartbeats", 
+                RequestVoteResponse, leader ignores this msg, probably leader got majority before receiving all votes", 
                 self.config.self_id, self.state.current_term);
             }
         };
@@ -327,15 +333,15 @@ impl Raft {
         match &mut self.process_type 
         {
             ProcessType::Follower => {
-                info!("Follower got HeartBeatResponse - this shouldnt happen, should we panic?");
+                info!("FOLLOWER got HeartBeatResponse - it probably used to be a LEADER and stopped being one before receiving all hearbeat responses, IGNORING this msg");
             }
             ProcessType::Candidate { .. } => {
-                info!("Candidate got HeartBeatResponse - this shouldnt happen, should we panic?");
+                info!("CANDIDATE got HeartBeatResponse - it probably used to be a LEADER and stopped being one before receiving all hearbeat responses, IGNORING this msg");
             }
             ProcessType::Leader => {
-                info!("Leader got HeartBeatResponse");
                 if self.state.current_term < heartbeat_term
                 {
+                    info!("LEADER: '{}' updated his TERM ({}) to a new one ({})", self.config.self_id , self.state.current_term, heartbeat_term);
                     // if the Leader's Heartbeat has an outdated term, this lets leader update its term
                     self.state.current_term = heartbeat_term;
                     self.update_state();
