@@ -1,11 +1,12 @@
 use log::info;
 use module_system::{Handler, ModuleRef, System, TimerHandle};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use tokio::time::Duration;
 use uuid::Uuid;
 
 // As always, do not invalidate the public interfaces and modify only explicitly marked areas.
 // You may add new derives and private methods as needed.
+const N_HEARTBEATS_DURING_TIMEOUT: u32 = 10;
 
 /// State of a Raft process.
 /// It shall be kept in stable storage, and updated before replying to messages.
@@ -215,7 +216,6 @@ impl Raft {
         candidate_term: u64,
     )
     {
-        self.update_state();
         let resp_header = RaftMessageHeader {term: self.state.current_term};
         let content: RaftMessageContent;
 
@@ -234,6 +234,8 @@ impl Raft {
                             granted: false, 
                             source: self.config.self_id 
                     };
+                    // If we reject we do not reset_timer, since now we wait for
+                    // new leader heartbeat
                 }
                 else
                 {
@@ -245,6 +247,9 @@ impl Raft {
                             granted: true, 
                             source: self.config.self_id 
                     };
+                    // We reset timer and wait for new leader hearbeat
+                    // So we basically give this candidate time to gather votes
+                    self.reset_timer(self.config.election_timeout).await;
                 }
             }
             ProcessType::Candidate { .. } => {
@@ -258,6 +263,9 @@ impl Raft {
                             granted: true, 
                             source: self.config.self_id 
                     };
+                    // We reset timer and wait for new leader hearbeat
+                    // So we basically give this candidate time to gather votes
+                    self.reset_timer(self.config.election_timeout).await;
                 }
                 else
                 {
@@ -267,13 +275,18 @@ impl Raft {
                             granted: false, 
                             source: self.config.self_id 
                     };
+                    // We do not reset timer, since we wait for timeout to count
+                    // our votes
                 }
             }
             ProcessType::Leader => {
                 info!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
                 RequestVoteResponse, leader ignores this msg, probably some process died and revived after leader sent heartbeats", 
                 self.config.self_id, self.state.current_term);
-                return;
+                content = RaftMessageContent::RequestVoteResponse { 
+                    granted: false, 
+                    source: self.config.self_id 
+                };
             }
         };
 
@@ -358,13 +371,74 @@ impl Handler<Timeout> for Raft {
         if self.enabled {
             match &mut self.process_type {
                 ProcessType::Follower => {
-                    unimplemented!();
-                }
-                ProcessType::Candidate { .. } => {
-                    unimplemented!();
+                    // If as a Follower we need to handle timeout, it means we
+                    // didn't get HeartBeat so we need to start election
+                    // Leader crashed and we didn't vote for anyone, so 
+                    // 1) We make ourselves a Candidate
+                    // 2) We vote for ourselves
+                    // 3) We increment our term number
+                    // 4) We start election by broadcasting RequestVote
+                    self.process_type = ProcessType::Candidate { 
+                        votes_received: HashSet::from(
+                            [self.config.self_id]
+                    )};
+
+                    self.state.current_term += 1;
+                    self.state.voted_for = Some(self.config.self_id);
+                    self.state.leader_id = None;
+                    self.update_state();
+
+
+                    self.sender.broadcast(RaftMessage { 
+                        header: RaftMessageHeader { 
+                            term: self.state.current_term 
+                        },
+                        content: RaftMessageContent::RequestVote { 
+                            candidate_id:  self.config.self_id
+                        }
+                    }).await;
+                },
+                ProcessType::Candidate { votes_received } => {
+                    // if at the end of timeout we are still Candidate this 
+                    // means that leader didn't send us any heartbeat, or it 
+                    // was too old, and that any other candidate didn't send us 
+                    // request to vote for them with big enough term.
+                    // Thus we check our votes and either we become leader or 
+                    // restart process
+                    if votes_received.len() > self.config.processes_count / 2
+                    {
+                        self.process_type = ProcessType::Leader;
+                        self.state.leader_id = Some(self.config.self_id);
+                        self.update_state();
+                        self.broadcast_heartbeat().await;
+                        self.reset_timer(self.config.election_timeout / N_HEARTBEATS_DURING_TIMEOUT).await;
+                    }
+                    else
+                    {
+                        // We didnt get enough votes thus we restart election
+                        // process
+                        self.process_type = ProcessType::Candidate { 
+                            votes_received: HashSet::from(
+                                [self.config.self_id]
+                        )};
+
+                        self.state.current_term += 1;
+                        self.state.leader_id = None;
+                        self.state.voted_for = Some(self.config.self_id);
+                        self.update_state();
+
+                        self.sender.broadcast(RaftMessage { 
+                            header: RaftMessageHeader { 
+                                term: self.state.current_term 
+                            },
+                            content: RaftMessageContent::RequestVote { 
+                                candidate_id:  self.config.self_id
+                            }
+                        }).await;
+                    }
                 }
                 ProcessType::Leader => {
-                    unimplemented!();
+                    self.broadcast_heartbeat().await;
                 }
             }
         }
