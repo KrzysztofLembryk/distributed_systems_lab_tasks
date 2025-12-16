@@ -49,6 +49,8 @@ impl TestProcessesConfig {
         }
     }
 
+    // In TestProcessessConfig we get config for all processes, and config function
+    // will get us Config for given proc_idx
     fn config(&self, proc_idx: usize) -> Configuration {
         Configuration {
             public: PublicConfiguration {

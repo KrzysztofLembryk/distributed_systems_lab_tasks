@@ -33,6 +33,19 @@ pub struct SectorVec(
     pub Box<serde_big_array::Array<u8, SECTOR_SIZE>>,
 );
 
+impl SectorVec
+{
+    pub fn as_slice(&self) -> &[u8]
+    {
+        // SectorVec is: (Box<serde_big_array::Array<u8, SECTOR_SIZE>>)
+        // - So we have tuple with one elem, thus to get Box we do: self.0
+        // - To get value inside Box we do: *self.0
+        // - Now we have Array, but we want its inside, we do: .as_slice()
+        // - Now we have [u8; SECTOR_SIZE], but we want reference, we do: &
+        return &(*self.0.as_slice());
+    }
+}
+
 pub type SectorIdx = u64;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
@@ -99,12 +112,79 @@ pub enum SystemRegisterCommandContent {
     Ack,
 }
 
+pub const SYS_READ_PROC_CMD_ID: u32 = 0;
+pub const SYS_VALUE_CMD_ID: u32 = 1;
+pub const SYS_WRITE_PROC_CMD_ID: u32 = 2;
+pub const SYS_ACK_CMD_ID: u32 = 3;
+
+impl SystemRegisterCommandContent
+{
+    pub fn encode(&self) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        match self
+        {
+            SystemRegisterCommandContent::ReadProc => {
+                bytes.extend_from_slice(&SYS_READ_PROC_CMD_ID.to_be_bytes());
+            },
+
+            SystemRegisterCommandContent::Value { 
+                timestamp, 
+                write_rank, 
+                sector_data 
+            } => {
+                bytes.extend_from_slice(&SYS_VALUE_CMD_ID.to_be_bytes());
+                bytes.extend_from_slice(&timestamp.to_be_bytes());
+                bytes.extend_from_slice(&write_rank.to_be_bytes());
+                bytes.extend_from_slice(sector_data.as_slice());
+            },
+
+            SystemRegisterCommandContent::WriteProc { 
+                timestamp, 
+                write_rank, 
+                data_to_write 
+            } => {
+                bytes.extend_from_slice(&SYS_WRITE_PROC_CMD_ID.to_be_bytes());
+                bytes.extend_from_slice(&timestamp.to_be_bytes());
+                bytes.extend_from_slice(&write_rank.to_be_bytes());
+                bytes.extend_from_slice(data_to_write.as_slice());
+            },
+            SystemRegisterCommandContent::Ack => {
+                bytes.extend_from_slice(&SYS_ACK_CMD_ID.to_be_bytes());
+            }
+        }
+        return bytes;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub enum ClientRegisterCommandContent {
     /// Read command from the client
     Read,
     /// Write command with new data from the client
     Write { data: SectorVec },
+}
+
+pub const CLIENT_READ_CMD_ID: u32 = 0;
+pub const CLIENT_WRITE_CMD_ID: u32 = 1;
+
+impl ClientRegisterCommandContent
+{
+    pub fn encode(&self) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        match self
+        {
+            ClientRegisterCommandContent::Read => {
+                bytes.extend_from_slice(&u32::to_be_bytes(CLIENT_READ_CMD_ID));
+            },
+            ClientRegisterCommandContent::Write { data } => {
+                bytes.extend_from_slice(&u32::to_be_bytes(CLIENT_WRITE_CMD_ID));
+                bytes.extend_from_slice(data.as_slice());
+            }
+        }
+        return bytes;
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Eq, PartialEq)]
@@ -115,6 +195,17 @@ pub struct ClientCommandHeader {
     pub sector_idx: SectorIdx,
 }
 
+impl ClientCommandHeader
+{
+    pub fn encode(&self) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&self.request_identifier.to_be_bytes());
+        bytes.extend_from_slice(&self.sector_idx.to_be_bytes());
+        return bytes;
+    }
+}
+
 #[derive(Debug, Clone, Copy, Eq, Serialize, Deserialize, PartialEq)]
 pub struct SystemCommandHeader {
     /// Sender identifier
@@ -123,6 +214,21 @@ pub struct SystemCommandHeader {
     pub msg_ident: Uuid,
     /// Register (sector) identifier
     pub sector_idx: SectorIdx,
+}
+
+pub const MSG_IDENT_LEN: u64 = 16;
+
+impl SystemCommandHeader
+{
+    pub fn encode(&self) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.extend_from_slice(&self.process_identifier.to_be_bytes());
+        bytes.extend_from_slice(&MSG_IDENT_LEN.to_be_bytes());
+        bytes.extend_from_slice(self.msg_ident.as_bytes());
+        bytes.extend_from_slice(&self.sector_idx.to_be_bytes());
+        return bytes;
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
