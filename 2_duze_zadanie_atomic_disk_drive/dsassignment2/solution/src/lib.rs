@@ -1,4 +1,5 @@
 mod domain;
+mod stable_storage;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -71,6 +72,7 @@ pub mod sectors_manager_public {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    // 64 file_descr for one client
     #[async_trait::async_trait]
     pub trait SectorsManager: Send + Sync {
         /// Returns 4096 bytes of sector data by index.
