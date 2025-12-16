@@ -99,11 +99,14 @@ pub mod transfer_public {
     use std::io::Error;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use hmac::{Hmac, Mac};
-    use crate::domain::{CLIENT_READ_CMD_ID, CLIENT_WRITE_CMD_ID, SYS_READ_PROC_CMD_ID, SYS_VALUE_CMD_ID, SYS_WRITE_PROC_CMD_ID, SYS_ACK_CMD_ID};
+    use crate::domain::{CLIENT_READ_CMD_ID, CLIENT_WRITE_CMD_ID, SYS_READ_PROC_CMD_ID, SYS_VALUE_CMD_ID, SYS_WRITE_PROC_CMD_ID, SYS_ACK_CMD_ID,
+    MSG_IDENT_LEN};
     use uuid::Uuid;
+    use log::{debug};
 
     type HmacSha256 = Hmac<Sha256>;
 
+    const HMAC_TAG_SIZE: usize = 32;
     const HMAC_CLIENT_KEY_SIZE: usize = 32;
     const HMAC_SYSTEM_KEY_SIZE: usize = 64;
     const CLIENT_REGISTER_CMD_ID: u32 = 0;
@@ -130,7 +133,7 @@ pub mod transfer_public {
     {
         let mut reader = CmdDeserializer::new(data);
         // cmd_size is payload + Hmac
-        let cmd_size = reader.read_cmd_size_u64().await?;
+        let read_cmd_size = reader.read_cmd_size_u64().await?;
         // Either SystemRegisterCommand or ClientRegisterCommand
         let cmd_type = reader.read_u32().await?;
 
@@ -138,7 +141,7 @@ pub mod transfer_public {
         {
             CLIENT_REGISTER_CMD_ID => {
                 return deserialize_client_cmd(
-                    cmd_size, 
+                    read_cmd_size, 
                     cmd_type, 
                     hmac_client_key, 
                     &mut reader
@@ -146,7 +149,7 @@ pub mod transfer_public {
             },
             SYSTEM_REGISTER_CMD_ID => {
                 return deserialize_system_cmd(
-                    cmd_size, 
+                    read_cmd_size, 
                     cmd_type, 
                     hmac_system_key, 
                     &mut reader
@@ -167,6 +170,8 @@ pub mod transfer_public {
         hmac_key: &[u8],
     ) -> Result<(), EncodingError> 
     {
+        debug!("serialize_register_command - start");
+
         if hmac_key.len() != HMAC_CLIENT_KEY_SIZE
         && hmac_key.len() != HMAC_SYSTEM_KEY_SIZE
         {
@@ -220,22 +225,30 @@ pub mod transfer_public {
     }
 
     async fn deserialize_system_cmd<'a> (
-        cmd_size: u64,
+        read_cmd_size: u64,
         cmd_type: u32,
-        hmac_system_key: &[u8; 64],
+        hmac_system_key: &[u8; HMAC_SYSTEM_KEY_SIZE],
         reader: &'a mut CmdDeserializer<'a>
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
+        debug!("deserialize_system_cmd - start");
         // --------------
         // READING HEADER
         // --------------
         let process_identifier: u8 = reader.read_u8().await?;
         let msg_ident_len: u64 = reader.read_u64().await?;
-        let msg_ident_vec = reader.read_n_bytes(msg_ident_len as usize).await?;
+
+        // Uuid is always 16 bytes
+        if msg_ident_len != MSG_IDENT_LEN
+        {
+            return Err(DecodingError::InvalidMessageSize);
+        }
+
+        let msg_ident_vec = reader.read_16_bytes().await?;
         let sector_idx: u64 = reader.read_u64().await?;
 
         // We need to convert msg_ident_vec to Uuid
-        let msg_ident_bytes: [u8; 16] = msg_ident_vec
+        let msg_ident_bytes: [u8; MSG_IDENT_LEN as usize] = msg_ident_vec
             .try_into()
             .map_err(|_| DecodingError::InvalidMessageSize)?;
         let msg_ident_uuid = Uuid::from_bytes(msg_ident_bytes);
@@ -265,9 +278,11 @@ pub mod transfer_public {
         match system_op_cmd
         {
             SYS_READ_PROC_CMD_ID => {
+                debug!("deserialize_system_cmd - command:  READ");
                 content = SystemRegisterCommandContent::ReadProc;
             },
             SYS_VALUE_CMD_ID => {
+                debug!("deserialize_system_cmd - command:  VALUE");
                 let t_stamp: u64 = reader.read_u64().await?;
                 let write_rank: u8 = reader.read_u8().await?;
                 let sector_data: SectorVec = reader.read_sector_data().await?;
@@ -283,6 +298,7 @@ pub mod transfer_public {
                 };
             },
             SYS_WRITE_PROC_CMD_ID => {
+                debug!("deserialize_system_cmd - command: WRITE");
                 let t_stamp: u64 = reader.read_u64().await?;
                 let write_rank: u8 = reader.read_u8().await?;
                 let data_to_write: SectorVec = reader.read_sector_data().await?;
@@ -298,6 +314,7 @@ pub mod transfer_public {
                 };
             },
             SYS_ACK_CMD_ID => {
+                debug!("deserialize_system_cmd - command: ACK");
                 content = SystemRegisterCommandContent::Ack;
             },
             _ => {
@@ -309,14 +326,15 @@ pub mod transfer_public {
         }
 
         let read_hmac_tag = reader.read_32_bytes().await?;
-        let calc_hmac_tag: [u8; 32] = mac.finalize().into_bytes().into();
+        let calc_hmac_tag: [u8; HMAC_TAG_SIZE] = mac.finalize().into_bytes().into();
         let is_hmac_valid: bool = read_hmac_tag == calc_hmac_tag;
 
         // This means that provided size in data is greater than the
         // size we read (there still might be some more data inside
         // reader but we don't care)
-        if reader.size_read() != cmd_size
+        if reader.size_read() != read_cmd_size
         {
+            debug!("deserialize_system_cmd - reader.size_read ({}) != read_cmd_size ({})", reader.size_read(), read_cmd_size);
             return Err(DecodingError::InvalidMessageSize);
         }
 
@@ -329,12 +347,13 @@ pub mod transfer_public {
     }
 
     async fn deserialize_client_cmd<'a> (
-        cmd_size: u64,
+        read_cmd_size: u64,
         cmd_type: u32,
-        hmac_client_key: &[u8; 32],
+        hmac_client_key: &[u8; HMAC_CLIENT_KEY_SIZE],
         reader: &'a mut CmdDeserializer<'a>
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
+        debug!("deserialize_client_cmd - start");
         // --------------
         // READING HEADER
         // --------------
@@ -362,9 +381,11 @@ pub mod transfer_public {
         match client_op_cmd
         {
             CLIENT_READ_CMD_ID => {
+                debug!("deserialize_client_cmd - command: READ");
                 content = ClientRegisterCommandContent::Read;
             },
             CLIENT_WRITE_CMD_ID => {
+                debug!("deserialize_client_cmd - command: WRITE");
                 // If there is to little data, reader returns error
                 let sector_data = reader.read_sector_data().await?;
             
@@ -385,14 +406,15 @@ pub mod transfer_public {
         }
 
         let read_hmac_tag = reader.read_32_bytes().await?;
-        let calc_hmac_tag: [u8; 32] = mac.finalize().into_bytes().into();
+        let calc_hmac_tag: [u8; HMAC_TAG_SIZE] = mac.finalize().into_bytes().into();
         let is_hmac_valid: bool = read_hmac_tag == calc_hmac_tag;
 
         // This means that provided size in data is greater than the
         // size we read (there still might be some more data inside
         // reader but we don't care)
-        if reader.size_read() != cmd_size
+        if reader.size_read() != read_cmd_size
         {
+            debug!("deserialize_client_cmd - reader.size_read ({}) != read_cmd_size ({}", reader.size_read(), read_cmd_size);
             return Err(DecodingError::InvalidMessageSize);
         }
         // TODO: should we check if reader.read_u8 returns error 
@@ -414,10 +436,8 @@ pub mod transfer_public {
     ) -> Vec<u8>
     {
         let mut encoded_cmd: Vec<u8> = Vec::new();
-        // hmac is alwyas 32 bytes
-        let hmac_size: usize = 32;
         let cmd_id_size = std::mem::size_of::<u32>();
-        let msg_size: u64 = (payload.len() + hmac_size + cmd_id_size) as u64;
+        let msg_size: u64 = (payload.len() + HMAC_TAG_SIZE + cmd_id_size) as u64;
 
         // Initialize a new MAC instance from the hmac key:
         let mut mac = HmacSha256::new_from_slice(hmac_key).unwrap();
@@ -447,6 +467,7 @@ pub mod transfer_public {
     {
         fn new(data: &'a mut (dyn AsyncRead + Send + Unpin)) -> Self 
         {
+            debug!("CmdDeserializer::new()");
             CmdDeserializer {reader: data, size_read: 0}
         }
 
@@ -458,6 +479,7 @@ pub mod transfer_public {
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_u8 - unexpectedEof");
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
@@ -476,6 +498,7 @@ pub mod transfer_public {
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_u32 - unexpectedEof");
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
@@ -494,6 +517,7 @@ pub mod transfer_public {
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_u64 - unexpectedEof");
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
@@ -513,6 +537,8 @@ pub mod transfer_public {
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+
+                        debug!("CmdDeserializer::read_cmd_size_u64 - unexpectedEof");
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
@@ -530,6 +556,7 @@ pub mod transfer_public {
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_32_bytes - unexpectedEof");
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
@@ -537,6 +564,25 @@ pub mod transfer_public {
                     }
                 })?;
             self.size_read += 32;
+            return Ok(buf);
+        }
+
+        async fn read_16_bytes(&mut self) -> Result<[u8; 16], DecodingError>
+        {
+            let mut buf = [0u8; 16];
+            self.reader
+                .read_exact(&mut buf)
+                .await
+                .map_err(|e| match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_32_bytes - unexpectedEof");
+                        DecodingError::InvalidMessageSize
+                    },
+                    _ => {
+                        DecodingError::IoError(e)
+                    }
+                })?;
+            self.size_read += 16;
             return Ok(buf);
         }
 
@@ -554,12 +600,19 @@ pub mod transfer_public {
 
         async fn read_n_bytes(&mut self, len: usize) -> Result<Vec<u8>, DecodingError>
         {
+            const MAX_ALLOWED_SIZE: usize = SECTOR_SIZE;
+            if len > MAX_ALLOWED_SIZE
+            {
+                return Err(DecodingError::InvalidMessageSize);
+            }
+            
             let mut buf = vec![0u8; len];
             self.reader
                 .read_exact(&mut buf)
                 .await
                 .map_err(|e| match e.kind() {
                     std::io::ErrorKind::UnexpectedEof => {
+                        debug!("CmdDeserializer::read_n_bytes ({}) - unexpectedEof", len);
                         DecodingError::InvalidMessageSize
                     },
                     _ => {
