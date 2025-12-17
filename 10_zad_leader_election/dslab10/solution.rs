@@ -450,15 +450,8 @@ impl Handler<Timeout> for Raft {
 impl Handler<RaftMessage> for Raft {
     async fn handle(&mut self, msg: RaftMessage) {
         if self.enabled {
-            let prev_self_term = self.state.current_term;
             // Reset the term and become a follower if we're outdated:
             self.check_for_higher_term(&msg);
-
-            if prev_self_term < self.state.current_term 
-            {
-                // update state if we had older term
-                self.update_state();
-            }
 
             // TODO message specific processing. Heartbeat is given as an example:
             match (&mut self.process_type, msg.content) 
