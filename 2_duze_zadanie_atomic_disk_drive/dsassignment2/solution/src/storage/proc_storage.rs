@@ -108,7 +108,8 @@ impl ProcStorage
             panic!("check_tmp_file was given a file name: '{tmp_file_name}' without 'tmp' prefix, this might cause corruption");
         }
 
-        let (sector_idx, timestamp, writer_rank, checksum) = extract_data_from_temp_file_name(&tmp_file_name);
+        let (sector_idx, timestamp, writer_rank, checksum) =    
+            extract_data_from_temp_file_name(&tmp_file_name);
         let data = t_fs::read(tmp_file_path).await.expect("check_tmp_file - tokio::fs::read failed");
         let computed_hash = Sha256::digest(&data);
 
