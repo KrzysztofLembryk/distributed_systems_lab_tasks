@@ -8,99 +8,13 @@ use crate::storage::utils::{create_file_name, create_temp_file_name, extract_dat
 
 /// RawFileManager struct implements SectorsManager, it takes care of raw writing to 
 /// and reading from files. In our implementation one SECTOR has ONE FILE.
-pub struct RawFileManager
+pub struct StableFileManager
 {
     root_dir: PathBuf,
 }
 
-impl RawFileManager
-{
-    pub fn new(root_dir: PathBuf) -> RawFileManager
-    {
-        return RawFileManager { root_dir };
-    }
-
-    /// Saves exactly SECTOR_SIZE bytes otherwise *panics*. <br>
-    /// If file or dir we write to doesn't exist it also *panics*.
-    async fn save_data_to_file(&self, data: &[u8], path: &PathBuf)
-    {
-        if data.len() != SECTOR_SIZE
-        {
-            panic!("RawFileManager::save_data_to_file - provided data len ({}) is not equal to SECTOR_SIZE ({})", data.len(), SECTOR_SIZE);
-        }
-        // We do everywhere 'expect' since these are filesystem operations
-        // and if they fail we are expected to panic
-
-        // Write either creates or overwrites existing file
-        t_fs::write(&path, data)
-            .await
-            .expect("save_data_to_file - Failed to write file");
-
-        // We sync file to transfer it to disk
-        let file = t_fs::File::open(&path)
-            .await
-            .expect("save_data_to_file - Failed to open file for sync");
-
-        file.sync_data()
-            .await
-            .expect("save_data_to_file - fdatasync failed on file");
-
-        // We need to sync directory to ensure write happended
-        let dir = t_fs::File::open(&self.root_dir)
-            .await
-            .expect("save_data_to_file - failed to open directory for sync");
-    
-        dir.sync_data()
-            .await
-            .expect("save_data_to_file - fdatasync failed on directory");
-    }
-
-    /// Expects to read **exactly** SECTOR_SIZE bytes - otherwise *panics*. <br>
-    /// If file for given path does not exist it also *panics*.
-    async fn read_file_data(&self, path: &PathBuf) -> SectorVec
-    {
-        // We assume that we get path from self.file_keys, so we know that file
-        // exists
-        let data = match t_fs::read(path).await{
-            Ok(d) => d,
-            Err(e) => panic!("read_file_data - read func returned error: {e}")
-        };
-
-        if data.len() != SECTOR_SIZE
-        {
-            panic!("read_file_data - read data len ({}) is not equalt to SECTOR_SIZE ({}) - this shouldn't have happened", data.len(), SECTOR_SIZE);
-        }
-
-        // This should never panic because of above if
-        let data_arr: [u8; SECTOR_SIZE] = data.try_into().unwrap();
-
-        return SectorVec::new_from_slice(&data_arr);
-    }
-
-    /// *Panics* if file or directory doesn't exist
-    async fn remove_file(&self, path: &PathBuf)
-    {
-        // We do everywhere expect since these are filesystem operations
-        // and if they fail we are expected to panic
-
-        // if file doesn't exist remove_file returns NotFound, should we panic?
-        t_fs::remove_file(path)
-            .await
-            .expect("remove_file - remove file system function failed");
-
-        // We need to sync directory 
-        let dir = t_fs::File::open(&self.root_dir)
-            .await
-            .expect("check_tmp_file - failed to open directory for sync");
-    
-        dir.sync_data()
-            .await
-            .expect("check_tmp_file - fdatasync failed on directory");
-    }
-}
-
 #[async_trait::async_trait]
-impl SectorsManager for RawFileManager
+impl SectorsManager for StableFileManager
 {
     /// Returns 4096 bytes of sector data by index. If file for given idx doesn't 
     /// exist it returns 4096 zero bytes. <br>
@@ -221,9 +135,91 @@ impl SectorsManager for RawFileManager
 
         self.save_data_to_file(data_to_write.as_slice(), &dest_file_path).await;
         self.remove_file(&tmp_file_path).await;
+    }
+}
 
-        // We don't have mut self
-        // self.sector_idx_to_file_name_map.insert(sector_idx, file_name.clone());
-        // self.file_name_to_path_map.insert(file_name, dest_file_path);
+impl StableFileManager
+{
+    pub fn new(root_dir: PathBuf) -> StableFileManager
+    {
+        return StableFileManager { root_dir };
+    }
+
+    /// Saves exactly SECTOR_SIZE bytes otherwise *panics*. <br>
+    /// If file or dir we write to doesn't exist it also *panics*.
+    async fn save_data_to_file(&self, data: &[u8], path: &PathBuf)
+    {
+        if data.len() != SECTOR_SIZE
+        {
+            panic!("RawFileManager::save_data_to_file - provided data len ({}) is not equal to SECTOR_SIZE ({})", data.len(), SECTOR_SIZE);
+        }
+        // We do everywhere 'expect' since these are filesystem operations
+        // and if they fail we are expected to panic
+
+        // Write either creates or overwrites existing file
+        t_fs::write(&path, data)
+            .await
+            .expect("save_data_to_file - Failed to write file");
+
+        // We sync file to transfer it to disk
+        let file = t_fs::File::open(&path)
+            .await
+            .expect("save_data_to_file - Failed to open file for sync");
+
+        file.sync_data()
+            .await
+            .expect("save_data_to_file - fdatasync failed on file");
+
+        // We need to sync directory to ensure write happended
+        let dir = t_fs::File::open(&self.root_dir)
+            .await
+            .expect("save_data_to_file - failed to open directory for sync");
+    
+        dir.sync_data()
+            .await
+            .expect("save_data_to_file - fdatasync failed on directory");
+    }
+
+    /// Expects to read **exactly** SECTOR_SIZE bytes - otherwise *panics*. <br>
+    /// If file for given path does not exist it also *panics*.
+    async fn read_file_data(&self, path: &PathBuf) -> SectorVec
+    {
+        // We assume that we get path from self.file_keys, so we know that file
+        // exists
+        let data = match t_fs::read(path).await{
+            Ok(d) => d,
+            Err(e) => panic!("read_file_data - read func returned error: {e}")
+        };
+
+        if data.len() != SECTOR_SIZE
+        {
+            panic!("read_file_data - read data len ({}) is not equalt to SECTOR_SIZE ({}) - this shouldn't have happened", data.len(), SECTOR_SIZE);
+        }
+
+        // This should never panic because of above if
+        let data_arr: [u8; SECTOR_SIZE] = data.try_into().unwrap();
+
+        return SectorVec::new_from_slice(&data_arr);
+    }
+
+    /// *Panics* if file or directory doesn't exist
+    async fn remove_file(&self, path: &PathBuf)
+    {
+        // We do everywhere expect since these are filesystem operations
+        // and if they fail we are expected to panic
+
+        // if file doesn't exist remove_file returns NotFound, should we panic?
+        t_fs::remove_file(path)
+            .await
+            .expect("remove_file - remove file system function failed");
+
+        // We need to sync directory 
+        let dir = t_fs::File::open(&self.root_dir)
+            .await
+            .expect("check_tmp_file - failed to open directory for sync");
+    
+        dir.sync_data()
+            .await
+            .expect("check_tmp_file - fdatasync failed on directory");
     }
 }

@@ -71,7 +71,7 @@ pub mod sectors_manager_public {
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use crate::storage::raw_file_manager::RawFileManager;
+    use crate::storage::stable_file_manager::StableFileManager;
 
     // 64 file_descr for one client
     #[async_trait::async_trait]
@@ -91,7 +91,7 @@ pub mod sectors_manager_public {
 
     /// Path parameter points to a directory to which this method has exclusive access.
     pub async fn build_sectors_manager(path: PathBuf) -> Arc<dyn SectorsManager> {
-        return Arc::new(RawFileManager::new(path));
+        return Arc::new(StableFileManager::new(path));
     }
 }
 

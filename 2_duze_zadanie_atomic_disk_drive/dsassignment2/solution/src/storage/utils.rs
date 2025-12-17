@@ -3,11 +3,11 @@ use std::{path::PathBuf};
 use std::collections::{HashMap};
 
 use crate::domain::{SectorIdx};
-use crate::storage::storage_defs::{TimeStampType, WriteRankType, TMP_PREFIX};
+use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX};
 
 pub fn extract_data_from_temp_file_name(
     tmp_file_name: &str
-) -> (SectorIdx, TimeStampType, WriteRankType, &str)
+) -> (SectorIdx, TimeStampType, WriterRankType, &str)
 {
     // We expect this function to be called onlt if sb checked that temp_file
     // starts with 'tmp_'
@@ -42,7 +42,7 @@ pub fn extract_data_from_temp_file_name(
 
 pub fn extract_data_from_file_name(
     file_name: &str
-) -> (SectorIdx, TimeStampType, WriteRankType)
+) -> (SectorIdx, TimeStampType, WriterRankType)
 {
     let mut iter = file_name.split_terminator('_');
 
@@ -69,7 +69,7 @@ pub fn create_temp_file_name(
     checksum: &str, 
     sector_idx: SectorIdx, 
     timestamp: TimeStampType, 
-    writer_rank: WriteRankType
+    writer_rank: WriterRankType
 ) -> String
 {
     return format!("{}_{}_{}_{}_{}", TMP_PREFIX, checksum, sector_idx, timestamp, writer_rank);
@@ -78,7 +78,7 @@ pub fn create_temp_file_name(
 pub fn create_file_name(
     sector_idx: SectorIdx, 
     timestamp: TimeStampType, 
-    writer_rank: WriteRankType
+    writer_rank: WriterRankType
 ) -> String
 {
     return format!("{}_{}_{}", sector_idx, timestamp, writer_rank);

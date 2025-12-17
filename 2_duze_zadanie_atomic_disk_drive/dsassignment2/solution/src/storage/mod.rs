@@ -1,4 +1,4 @@
-pub mod raw_file_manager;
-mod stable_storage;
+pub mod stable_file_manager;
+mod proc_storage;
 mod utils;
 mod storage_defs;

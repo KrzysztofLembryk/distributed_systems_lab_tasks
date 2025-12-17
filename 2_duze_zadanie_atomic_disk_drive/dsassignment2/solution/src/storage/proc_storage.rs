@@ -1,14 +1,15 @@
 use std::{path::PathBuf};
 use tokio::fs as t_fs;
+use uuid::timestamp;
 use std::collections::{HashMap};
 use sha2::{Sha256, Digest};
 use std::io::ErrorKind;
+use std::sync::Arc;
+
 use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
 use crate::sectors_manager_public::{SectorsManager};
-use crate::storage::storage_defs::{TMP_PREFIX};
+use crate::storage::storage_defs::{TMP_PREFIX, TimeStampType, WriterRankType};
 use crate::storage::utils::{create_file_name, extract_data_from_file_name, extract_data_from_temp_file_name, scan_dir_and_create_file_name_to_path_map};
-
-
 
 // ################################ FILE NAME FORMAT ################################
 // For normal files: "SectorIdx_timestamp_writeRank"
@@ -19,38 +20,63 @@ use crate::storage::utils::{create_file_name, extract_data_from_file_name, extra
 // ############################ STORING SECTORS IN FILES ############################
 // We store ONE SECTOR PER FILE, if data we write doesn't have 4096 bytes we append 0
 // to it so that it we always store 4096 bytes
-struct Storage
+
+// This struct is only used when creating new process/recovering from crash.
+// We search through process directory, read all files from it, recover data from
+// temp files and create hashmaps with sector idx, file names and file paths
+// so that we can spawn tasks for given sector.
+// We have files only for sectors that were written to.
+struct ProcStorage
 {
     root_dir: PathBuf,
-    file_name_to_path_map: HashMap<String, PathBuf>,
-    sector_idx_to_file_name_map: HashMap<SectorIdx, String>,
+    sector_idx_metadata_map: HashMap<SectorIdx, (TimeStampType, WriterRankType)>,
 }
 
-impl Storage
+impl ProcStorage
 {
-    pub fn new(
+    pub async fn recover(
         root_dir: PathBuf,
-        file_name_to_path_map: HashMap<String, PathBuf>, 
-    ) -> Storage
+    ) -> ProcStorage
     {
-        Storage{
+        let file_name_to_path_map = 
+            match scan_dir_and_create_file_name_to_path_map(&root_dir).await
+            {
+                Ok(m) => m,
+                Err(e) => panic!("build_stable_storage - find_file_paths_and_names - got 'filesystem operation fails' error: '{}'", e)
+            };
+
+        let mut storage = ProcStorage{
             root_dir,
-            file_name_to_path_map,
-            sector_idx_to_file_name_map: HashMap::new(),
-        }
+            sector_idx_metadata_map: HashMap::new(),
+        };
+        storage.do_the_recovery(file_name_to_path_map).await;
+
+        return storage;
     }
 
-    pub async fn recover(&mut self)
+    pub fn spawn_task_for_each_sector(&self)
+    {
+
+    }
+
+    async fn do_the_recovery(
+        &mut self, 
+        mut file_name_to_path_map: HashMap<String, PathBuf>
+    )
     {
         // we clone here so that we can modify our map inside check_tmp_file
-        let keys = self.file_name_to_path_map.clone();
+        let map_cloned = file_name_to_path_map.clone();
 
-        for (file_name, file_path) in &keys
+        for (file_name, file_path) in &map_cloned
         {
             // Only when we have tmp file we need to do anything, either remove it or save its data to file
             if file_name.starts_with(TMP_PREFIX)
             {
-                match self.check_tmp_file(file_name, file_path).await
+                match self.check_tmp_file(
+                    file_name, 
+                    file_path, 
+                    &mut file_name_to_path_map
+                ).await
                 {
                     Err(_) => (), // this means we got incorrect checksum
                     _ => ()
@@ -59,20 +85,22 @@ impl Storage
         }
 
         // After above loop all tmp files are deleted and we have only data that was
-        // not corrupted, and only file_names in our map, so we can create sector_idx
-        // to file_name map
-        for (file_name, _) in &self.file_name_to_path_map
+        // not corrupted, and only file_names in our map, so we can create a map with
+        // sector_idx as key and (timestamp, worker_rank) as value
+        for (file_name, _) in &file_name_to_path_map
         {
-            let (sector_idx, _, _) = extract_data_from_file_name(file_name);
-            self.sector_idx_to_file_name_map
-                .insert(sector_idx, file_name.to_string());
+            let (sector_idx, timestamp, writer_rank) = 
+                extract_data_from_file_name(file_name);
+            self.sector_idx_metadata_map
+                .insert(sector_idx, (timestamp, writer_rank));
         }
     }
 
     async fn check_tmp_file(
         &mut self, 
         tmp_file_name: &String,
-        tmp_file_path: &PathBuf
+        tmp_file_path: &PathBuf,
+        file_name_to_path_map: &mut HashMap<String, PathBuf>
     ) -> std::io::Result<()>
     {
         if !tmp_file_name.starts_with(TMP_PREFIX)
@@ -81,23 +109,14 @@ impl Storage
         }
 
         let (sector_idx, timestamp, writer_rank, checksum) = extract_data_from_temp_file_name(&tmp_file_name);
-
         let data = t_fs::read(tmp_file_path).await.expect("check_tmp_file - tokio::fs::read failed");
-
-        // if our programme runs correctly this will always be true, since we do ONE 
-        // FILE FOR ONE SECTOR, but if sb tempered with our storage this might happen
-        if data.len() != SECTOR_SIZE 
-        {
-            panic!("check_tmp_file - File: '{tmp_file_name}' size ({}) is not equal to SECTOR_SIZE ({}), this shouldn't have happened", data.len(), SECTOR_SIZE);
-        }
-
         let computed_hash = Sha256::digest(&data);
 
         if computed_hash.as_slice() != checksum.as_bytes()
         {
             // We will remove tmp file since it was corrupted
-            self.remove_file(tmp_file_path).await;
-            self.file_name_to_path_map.remove(tmp_file_name);
+            ProcStorage::remove_file(tmp_file_path, &self.root_dir).await;
+            file_name_to_path_map.remove(tmp_file_name);
 
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -110,16 +129,16 @@ impl Storage
         let dest_file_name = create_file_name(sector_idx, timestamp, writer_rank);
         let dest_path = self.root_dir.join(&dest_file_name);
 
-        self.save_data_to_file(&data, &dest_path).await;
-        self.remove_file(tmp_file_path).await;
+        ProcStorage::save_data_to_file(&data, &dest_path, &self.root_dir).await;
+        ProcStorage::remove_file(tmp_file_path, &self.root_dir).await;
 
-        self.file_name_to_path_map.remove(tmp_file_name);
-        self.file_name_to_path_map.insert(dest_file_name, dest_path.clone());
+        file_name_to_path_map.remove(tmp_file_name);
+        file_name_to_path_map.insert(dest_file_name, dest_path.clone());
 
         Ok(())
     }
 
-    async fn read_file_data(&self, path: &PathBuf) -> SectorVec
+    async fn read_file_data(path: &PathBuf) -> SectorVec
     {
         // We assume that we get path from self.file_keys, so we know that file
         // exists
@@ -139,7 +158,7 @@ impl Storage
         return SectorVec::new_from_slice(&data_arr);
     }
 
-    async fn remove_file(&self, path: &PathBuf)
+    async fn remove_file(path: &PathBuf, root_dir: &PathBuf)
     {
         // We do everywhere expect since these are filesystem operations
         // and if they fail we are expected to panic
@@ -149,7 +168,7 @@ impl Storage
             .expect("remove_file - remove file system function failed");
 
         // We need to sync directory 
-        let dir = t_fs::File::open(&self.root_dir)
+        let dir = t_fs::File::open(root_dir)
             .await
             .expect("check_tmp_file - failed to open directory for sync");
     
@@ -159,7 +178,7 @@ impl Storage
 
     }
 
-    async fn save_data_to_file(&self, data: &[u8], path: &PathBuf)
+    async fn save_data_to_file(data: &[u8], path: &PathBuf, root_dir: &PathBuf)
     {
         // We do everywhere 'expect' since these are filesystem operations
         // and if they fail we are expected to panic
@@ -179,7 +198,7 @@ impl Storage
             .expect("save_data_to_file - fdatasync failed on file");
 
         // We need to sync directory to ensure write happended
-        let dir = t_fs::File::open(&self.root_dir)
+        let dir = t_fs::File::open(root_dir)
             .await
             .expect("save_data_to_file - failed to open directory for sync");
     
@@ -190,25 +209,12 @@ impl Storage
 
 }
 
-
-/// Creates a new instance of stable storage.
+/// Creates a new instance of ProcStorage.
 async fn build_stable_storage(
     root_storage_dir: PathBuf,
-) -> Box<Storage>  //-> Box<dyn SectorsManager> 
+) -> ProcStorage  //-> Box<dyn SectorsManager> 
 {
-    // When building new stable storage or recovering, we firstly read all files
-    // names so that we can quickly check if we have temp files and either recover 
-    // them or remove them. 
-    let file_map = match scan_dir_and_create_file_name_to_path_map(&root_storage_dir).await
-    {
-        Ok(m) => m,
-        Err(e) => panic!("build_stable_storage - find_file_paths_and_names - got filesystem operation fails error: '{}'", e)
-    };
-
-    let mut storage = Storage::new(root_storage_dir, file_map);
-    storage.recover().await;
-
-    Box::new(storage)
+    return ProcStorage::recover(root_storage_dir).await;
 }
 
 
