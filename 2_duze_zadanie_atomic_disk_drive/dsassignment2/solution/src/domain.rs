@@ -36,6 +36,11 @@ pub struct SectorVec(
 
 impl SectorVec
 {
+    pub fn new_from_slice(data: &[u8; SECTOR_SIZE]) -> SectorVec
+    {
+        return SectorVec(Box::new(serde_big_array::Array(*data)));
+    }
+
     pub fn as_slice(&self) -> &[u8]
     {
         // SectorVec is: (Box<serde_big_array::Array<u8, SECTOR_SIZE>>)
