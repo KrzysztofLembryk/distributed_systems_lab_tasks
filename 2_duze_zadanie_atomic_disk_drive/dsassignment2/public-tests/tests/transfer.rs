@@ -349,8 +349,8 @@ async fn serialized_read_proc_cmd_has_correct_format()
 {
     init_logger();
     // given
-    let sector_idx = 4_525_787_855_454_u64;
-    let process_identifier = 147_u8;
+    let sector_idx: u64 = 4_525_787_855_454;
+    let process_identifier: u8 = 147;
     let msg_ident = [7; 16];
 
     let read_proc_cmd = RegisterCommand::System(SystemRegisterCommand {

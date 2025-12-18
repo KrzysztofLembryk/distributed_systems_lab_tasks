@@ -7,10 +7,17 @@ use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
 use crate::sectors_manager_public::{SectorsManager};
 
 use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX, SectorRwHashMap};
-use crate::storage::utils::{create_file_name, create_temp_file_name, extract_data_from_file_name, extract_data_from_temp_file_name, scan_dir_and_create_file_name_to_path_map, create_sector_idx_to_metadata_map};
+use crate::storage::storage_utils::{create_file_name, create_temp_file_name,extract_data_from_temp_file_name, scan_dir_and_create_file_name_to_path_map, create_sector_idx_to_metadata_map};
 
-/// RawFileManager struct implements SectorsManager, it takes care of raw writing to 
-/// and reading from files. In our implementation one SECTOR has ONE FILE.
+// ################################ FILE NAME FORMAT ################################
+// For normal files: "SectorIdx_timestamp_writeRank"
+// For temp files: "tmp_checksum_SectorIdx_timestamp_writeRank"
+// ############################# INITIAL SECTOR VALUES ##############################
+// If a sector was never written, both logical timestamp and the writer rank are 0, 
+// and that it contains 4096 zero bytes.
+// ############################ STORING SECTORS IN FILES ############################
+// We store have ONE FILE PER SECTOR
+
 pub struct StableSectorManager
 {
     root_dir: PathBuf,
