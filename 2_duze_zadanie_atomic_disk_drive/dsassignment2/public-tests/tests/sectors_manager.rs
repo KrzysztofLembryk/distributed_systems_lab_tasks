@@ -49,6 +49,8 @@ async fn data_survives_crash() {
     assert_eq!(data.0, Box::new(Array(*in_data)));
 }
 
+const N_TASKS: usize = 100;
+const N_SECTORS_BATCH: usize = 16;
 #[tokio::test]
 #[timeout(5000)]
 async fn many_concurrent_operation_on_different_sectors() {
@@ -56,8 +58,10 @@ async fn many_concurrent_operation_on_different_sectors() {
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager =
         Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
-    let tasks: usize = 10;
-    let sectors_batch = 16;
+    // let tasks: usize = 10;
+    // let sectors_batch = 16;
+    let tasks: usize = N_TASKS;
+    let sectors_batch = N_SECTORS_BATCH;
     let mut task_handles = vec![];
 
     // when
