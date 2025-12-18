@@ -71,7 +71,7 @@ pub mod sectors_manager_public {
     use crate::{SectorIdx, SectorVec};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use crate::storage::stable_file_manager::StableSectorManager;
+    use crate::storage::stable_sector_manager::StableSectorManager;
 
     // 64 file_descr for one client
     #[async_trait::async_trait]
