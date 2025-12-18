@@ -5,6 +5,8 @@ use std::collections::{HashMap};
 use crate::domain::{SectorIdx};
 use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX};
 
+
+
 pub fn extract_data_from_temp_file_name(
     tmp_file_name: &str
 ) -> (SectorIdx, TimeStampType, WriterRankType, &str)
@@ -112,4 +114,35 @@ pub async fn scan_dir_and_create_file_name_to_path_map(
     }
 
     Ok(file_name_to_path_map)
+}
+
+pub fn create_sector_idx_to_metadata_map(
+    file_name_to_path_map: &HashMap<String, PathBuf>,
+    ignore_tmp_files: bool
+) -> HashMap<SectorIdx, (TimeStampType, WriterRankType)> 
+{
+    let mut sector_idx_to_metadata_map = HashMap::new();
+
+    for (file_name, _) in file_name_to_path_map
+    {
+        if ignore_tmp_files 
+        {
+            if !file_name.starts_with(TMP_PREFIX)
+            {
+                let (sector_idx, timestamp, writer_rank) = extract_data_from_file_name(file_name);
+                sector_idx_to_metadata_map.insert(sector_idx, (timestamp, writer_rank));
+            }
+        }
+        else
+        {
+            // If file name is in tmp_file form this will panic.
+            // So we should use ignore_tmp_files = False if we know, or EXPECT that
+            // there are no tmp_files in file_name_file_path_map, if we did mistake
+            // we will get panic
+            let (sector_idx, timestamp, writer_rank) = extract_data_from_file_name(file_name);
+            sector_idx_to_metadata_map.insert(sector_idx, (timestamp, writer_rank));
+        }
+    }
+
+    return sector_idx_to_metadata_map;
 }
