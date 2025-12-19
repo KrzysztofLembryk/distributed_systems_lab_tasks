@@ -11,8 +11,13 @@ use crate::storage::storage_utils::{create_file_name, create_temp_file_name,extr
 
 
 #[cfg(test)]
-#[path = "./storage_tests/test_stable_sector_manager.rs"]
-mod test_stable_sector_manager;
+#[path = "./storage_tests/test_stable_sector_manager_recover.rs"]
+
+mod test_stable_sector_manager_recover;
+
+#[cfg(test)]
+#[path = "./storage_tests/test_stable_sector_manager_write.rs"]
+mod test_stable_sector_manager_write;
 
 // ################################ FILE NAME FORMAT ################################
 // For normal files: "SectorIdx_timestamp_writeRank"

@@ -1,17 +1,15 @@
 use ntest::timeout;
 use tempfile::tempdir;
 use std::collections::HashMap;
-use std::fs::File;
 use std::io;
 use std::path::{PathBuf, Path};
 use sha2::{Sha256, Digest};
 
 use crate::SectorsManager;
 use crate::storage::stable_sector_manager::StableSectorManager;
-use crate::domain::{SECTOR_SIZE, SectorVec, SectorIdx};
+use crate::domain::{SECTOR_SIZE, SectorIdx};
 use crate::storage::storage_utils::{create_temp_file_name, create_file_name};
 use crate::storage::storage_defs::{TimeStampType, WriterRankType};
-
 
 const SECTOR_IDX: SectorIdx = 1;
 const TIMESTAMP: u64 = 42;
@@ -318,7 +316,7 @@ async fn test_recover_many_files_various_states()
                 assert_eq!(read_wr, 0);
             }
             FileType::NORMAL_FILE => {
-                // Data and metadata should match file
+                // Data and metadata should match file, file shouldn't be deleted
                 let read_data = manager.read_data(*sector_idx).await;
                 assert_eq!(read_data.as_slice(), expected_data);
 
@@ -332,7 +330,7 @@ async fn test_recover_many_files_various_states()
                 check_if_file_deleted(Some(&checksum), *sector_idx, *timestamp, *writer_rank, root_path).await;
 
                 // old file should remain but with updated data
-                // Data and metadata should match tmp file (tmp wins)
+                // Data and metadata should match tmp file
                 let read_data = manager.read_data(*sector_idx).await;
                 assert_eq!(read_data.as_slice(), expected_data);
 
