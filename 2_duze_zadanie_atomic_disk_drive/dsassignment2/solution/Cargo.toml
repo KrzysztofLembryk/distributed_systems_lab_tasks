@@ -20,6 +20,11 @@ base64 = "0.22"
 derive_more = {version = "2.0.1", features = ["full"] }
 serde-big-array = "0.5"
 
+[dev-dependencies]
+ntest = "0.9"
+rand = "0.8"
+tempfile = "3.10"
+
 [lib]
 name = "assignment_2_solution"
 path = "src/lib.rs"

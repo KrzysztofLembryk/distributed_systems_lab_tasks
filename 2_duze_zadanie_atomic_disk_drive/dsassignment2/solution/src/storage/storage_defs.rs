@@ -2,6 +2,7 @@ use tokio::sync::RwLock;
 use std::collections::HashMap;
 use crate::domain::{SectorIdx};
 
+pub const AVAILABLE_FILE_DESCRIPTORS: usize = 997;
 // pub const CHECKSUM_SIZE: usize = 32;
 pub const TMP_PREFIX: &str = "tmp";
 

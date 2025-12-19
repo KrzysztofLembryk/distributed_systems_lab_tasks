@@ -50,9 +50,9 @@ async fn data_survives_crash() {
 }
 
 const N_TASKS: usize = 100;
-const N_SECTORS_BATCH: usize = 16;
+const N_SECTORS_BATCH: usize = 32;
 #[tokio::test]
-#[timeout(5000)]
+#[timeout(7000)]
 async fn many_concurrent_operation_on_different_sectors() {
     // given
     let root_drive_dir = tempdir().unwrap();

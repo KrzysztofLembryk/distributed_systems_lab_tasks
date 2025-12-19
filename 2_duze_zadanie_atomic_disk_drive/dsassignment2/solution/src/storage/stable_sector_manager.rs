@@ -9,6 +9,11 @@ use crate::sectors_manager_public::{SectorsManager};
 use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX, SectorRwHashMap};
 use crate::storage::storage_utils::{create_file_name, create_temp_file_name,extract_data_from_temp_file_name, scan_dir_and_create_file_name_to_path_map, create_sector_idx_to_metadata_map};
 
+
+#[cfg(test)]
+#[path = "./storage_tests/test_stable_sector_manager.rs"]
+mod test_stable_sector_manager;
+
 // ################################ FILE NAME FORMAT ################################
 // For normal files: "SectorIdx_timestamp_writeRank"
 // For temp files: "tmp_checksum_SectorIdx_timestamp_writeRank"
@@ -184,7 +189,7 @@ impl StableSectorManager
                 Ok(m) => m,
                 Err(e) => panic!("StableSectorManager::recover - scan_dir_and_create_file_name_to_path_map - got 'filesystem operation fails' error: '{}'", e)
             };
-
+        
         let sector_map = StableSectorManager::do_the_recovery(&root_dir, file_name_to_path_map).await;
 
         let storage = StableSectorManager{
@@ -218,7 +223,7 @@ impl StableSectorManager
         // but only if (old_timestamp, w_rank) != (new_timestamp, w_rank)
         // because if it equals, our tmp_file overwritten old_file so its OK
         let ignore_tmp_files = true;
-        let sector_idx_to_metadata_map = 
+        let sector_idx_metadata_of_non_tmp_files = 
             create_sector_idx_to_metadata_map(
                 &file_name_to_path_map, 
                 ignore_tmp_files
@@ -249,7 +254,7 @@ impl StableSectorManager
                         StableSectorManager::remove_old_file_if_exists(
                             file_name, 
                             root_dir, 
-                            &sector_idx_to_metadata_map, 
+                            &sector_idx_metadata_of_non_tmp_files, 
                             &mut file_name_to_path_map
                         ).await;
                     }
@@ -285,9 +290,9 @@ impl StableSectorManager
         let (sector_idx, timestamp, writer_rank, checksum) =    
             extract_data_from_temp_file_name(&tmp_file_name);
         let data = t_fs::read(tmp_file_path).await.expect("check_tmp_file - tokio::fs::read failed");
-        let computed_hash = Sha256::digest(&data);
+        let computed_hash = format!("{:x}", Sha256::digest(&data));
 
-        if computed_hash.as_slice() != checksum.as_bytes()
+        if computed_hash != checksum
         {
             // We will remove tmp file since it was corrupted
             StableSectorManager::remove_file(tmp_file_path, root_dir).await;
