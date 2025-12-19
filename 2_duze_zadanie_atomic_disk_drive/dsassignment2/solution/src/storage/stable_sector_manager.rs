@@ -1,13 +1,14 @@
 use tokio::fs as t_fs;
-use std::collections::HashMap;
+use tokio::io::AsyncReadExt;
 use std::{path::PathBuf};
 use sha2::{Sha256, Digest};
 
 use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
 use crate::sectors_manager_public::{SectorsManager};
-
-use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX, SectorRwHashMap};
-use crate::storage::storage_utils::{create_file_name, create_temp_file_name,extract_data_from_temp_file_name, scan_dir_and_create_file_name_to_path_map, create_sector_idx_to_metadata_map};
+use crate::storage::recovery_manager::RecoveryManager;
+use crate::storage::storage_defs::{SectorRwHashMap, MAX_AVAILABLE_FILE_DESCRIPTORS};
+use crate::storage::storage_utils::{create_file_name, create_temp_file_name, scan_dir_and_create_file_name_to_path_map};
+use crate::storage::file_descr_manager::{FileDescriptorManager};
 
 
 #[cfg(test)]
@@ -19,6 +20,12 @@ mod test_stable_sector_manager_recover;
 #[path = "./storage_tests/test_stable_sector_manager_write.rs"]
 mod test_stable_sector_manager_write;
 
+enum FileAccess<'a>
+{
+    FilePath(&'a PathBuf),
+    FileDescr(&'a mut tokio::fs::File)
+}
+
 // ################################ FILE NAME FORMAT ################################
 // For normal files: "SectorIdx_timestamp_writeRank"
 // For temp files: "tmp_checksum_SectorIdx_timestamp_writeRank"
@@ -26,12 +33,13 @@ mod test_stable_sector_manager_write;
 // If a sector was never written, both logical timestamp and the writer rank are 0, 
 // and that it contains 4096 zero bytes.
 // ############################ STORING SECTORS IN FILES ############################
-// We store have ONE FILE PER SECTOR
+// We store have ONE FILE PER SECTOR. Each sector will have ONE task that manages it.
 
 pub struct StableSectorManager
 {
     root_dir: PathBuf,
-    sector_map: SectorRwHashMap
+    sector_map: SectorRwHashMap,
+    descr_manager: FileDescriptorManager,
 }
 
 #[async_trait::async_trait]
@@ -48,10 +56,14 @@ impl SectorsManager for StableSectorManager
 
             if let Some(sector_metadata) = sector_map_reader.get(&idx)
             {
+                // If we have it in map this means there was WRITE to this sector
                 let (timestamp, writer_rank) = *sector_metadata;
 
                 // Explicit read lock drop before reading data from file
                 drop(sector_map_reader);
+
+                // Here we need to branch, if we have file descriptor we will use it
+                // otherwise we will use file path
 
                 let file_name = create_file_name(idx, timestamp, writer_rank);
                 let file_path = self.root_dir.join(file_name);
@@ -195,162 +207,18 @@ impl StableSectorManager
                 Err(e) => panic!("StableSectorManager::recover - scan_dir_and_create_file_name_to_path_map - got 'filesystem operation fails' error: '{}'", e)
             };
         
-        let sector_map = StableSectorManager::do_the_recovery(&root_dir, file_name_to_path_map).await;
+        let sector_map = RecoveryManager::do_the_recovery(
+                &root_dir, 
+                file_name_to_path_map
+            ).await;
 
         let storage = StableSectorManager{
             root_dir,
             sector_map: SectorRwHashMap::new(sector_map),
+            descr_manager: FileDescriptorManager::new(MAX_AVAILABLE_FILE_DESCRIPTORS)
         };
 
         return storage;
-    }
-
-    async fn do_the_recovery(
-        root_dir: &PathBuf,
-        mut file_name_to_path_map: HashMap<String, PathBuf>
-    ) -> HashMap<SectorIdx, (TimeStampType, WriterRankType)>
-    {
-        // we clone here so that we can modify our map inside check_tmp_file
-        let map_cloned = file_name_to_path_map.clone();
-        
-        // We need map that stores ALL NOT TEMP FILE NAMES, since the way we do WRITE
-        // is:
-        // - we firstly create a temp_file with new data, 
-        // - then after successful temp_file save, we delete old_file 
-        // - then after successful delete we create new_file (it might have 
-        //   different name than the old file since timestamp/writer_rank may have 
-        //   changed)
-        // - then we remove temp_file
-        //
-        // So at any given moment we have at most ONE NOT TEMP FILE for given sector
-        // but, if there was a crash, it might be an old_file
-        // So if recovery from tmp_file is successful we need to remove old_file
-        // but only if (old_timestamp, w_rank) != (new_timestamp, w_rank)
-        // because if it equals, our tmp_file overwritten old_file so its OK
-        let ignore_tmp_files = true;
-        let sector_idx_metadata_of_non_tmp_files = 
-            create_sector_idx_to_metadata_map(
-                &file_name_to_path_map, 
-                ignore_tmp_files
-        );
-
-        for (file_name, file_path) in &map_cloned
-        {
-            // Only when we have tmp file we need to do anything, either remove it or save its data to file
-            if file_name.starts_with(TMP_PREFIX)
-            {
-                match StableSectorManager::recover_from_tmp_file(
-                    root_dir,
-                    file_name, 
-                    file_path, 
-                    &mut file_name_to_path_map
-                ).await
-                {
-                    Err(_) => {
-                        // We got incorrect checksum, tmp_file has been deleted
-                        // If old_file exists we will use it
-                    }, 
-                    _ => {
-                        // Checksum was correct, so tmp_file has been deleted, but 
-                        // new_file has also been created.
-                        // So we need to check if file for sector_idx is present
-                        // in sector_idx_metadata_map, if it is it means that there
-                        // is an old_file and we need to delete it 
-                        StableSectorManager::remove_old_file_if_exists(
-                            file_name, 
-                            root_dir, 
-                            &sector_idx_metadata_of_non_tmp_files, 
-                            &mut file_name_to_path_map
-                        ).await;
-                    }
-                }
-            }
-        }
-
-        // After above loop all tmp files are deleted and we have only data that was
-        // not corrupted, and only file_names in our map, so we can create a map with
-        // sector_idx as key and (timestamp, worker_rank) as value
-        let ignore_tmp_files = false;
-        let sector_idx_to_metadata_map = 
-            create_sector_idx_to_metadata_map(
-                &file_name_to_path_map, 
-                ignore_tmp_files
-        );
-
-        return sector_idx_to_metadata_map;
-    }
-
-    async fn recover_from_tmp_file(
-        root_dir: &PathBuf,
-        tmp_file_name: &String,
-        tmp_file_path: &PathBuf,
-        file_name_to_path_map: &mut HashMap<String, PathBuf>
-    ) -> std::io::Result<()>
-    {
-        if !tmp_file_name.starts_with(TMP_PREFIX)
-        {
-            panic!("check_tmp_file was given a file name: '{tmp_file_name}' without 'tmp' prefix, this might cause corruption");
-        }
-
-        let (sector_idx, timestamp, writer_rank, checksum) =    
-            extract_data_from_temp_file_name(&tmp_file_name);
-        let data = t_fs::read(tmp_file_path).await.expect("check_tmp_file - tokio::fs::read failed");
-        let computed_hash = format!("{:x}", Sha256::digest(&data));
-
-        if computed_hash != checksum
-        {
-            // We will remove tmp file since it was corrupted
-            StableSectorManager::remove_file(tmp_file_path, root_dir).await;
-            file_name_to_path_map.remove(tmp_file_name);
-
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "Checksum mismatch"
-            )); 
-        }
-
-        // computed_hash is correct so we need to overwrite dstfile
-        // If the checksum is correct, tmpfile was fully written and a crash happened later. In this case the write can be resumed using the data from tmpfile
-        let dest_file_name = create_file_name(sector_idx, timestamp, writer_rank);
-        let dest_path = root_dir.join(&dest_file_name);
-
-        StableSectorManager::save_data_to_file(&data, &dest_path, root_dir).await;
-        StableSectorManager::remove_file(tmp_file_path, root_dir).await;
-
-        file_name_to_path_map.remove(tmp_file_name);
-        file_name_to_path_map.insert(dest_file_name, dest_path.clone());
-
-        Ok(())
-    }
-
-    async fn remove_old_file_if_exists(
-        tmp_file_name: &str,
-        root_dir: &PathBuf,
-        sector_idx_metadata_map:&HashMap<SectorIdx, (TimeStampType, WriterRankType)>,
-        file_name_to_path_map: &mut HashMap<String, PathBuf>
-    )
-    {
-        let (sector_idx, new_timestamp, new_writer_rank, _) = 
-            extract_data_from_temp_file_name(tmp_file_name);
-
-        if let Some(meta) = sector_idx_metadata_map.get(&sector_idx)
-        {
-            let (old_timestamp, old_writer_rank) = *meta;
-
-            if (old_timestamp, old_writer_rank) 
-                != (new_timestamp, new_writer_rank) 
-            {
-                let old_file_name = create_file_name(
-                    sector_idx, 
-                    old_timestamp, 
-                    old_writer_rank
-                );
-                let old_file_path = root_dir.join(&old_file_name);
-
-                file_name_to_path_map.remove(&old_file_name);
-                StableSectorManager::remove_file(&old_file_path, root_dir).await;
-            }
-        }
     }
 
     /// Saves exactly SECTOR_SIZE bytes otherwise *panics*. <br>
@@ -390,24 +258,28 @@ impl StableSectorManager
 
     /// Expects to read **exactly** SECTOR_SIZE bytes - otherwise *panics*. <br>
     /// If file for given path does not exist it also *panics*.
-    async fn read_file_data(path: &PathBuf) -> SectorVec
+    async fn read_file_data<'a>(
+        access: FileAccess<'a>
+    ) -> (SectorVec, Option<t_fs::File>)
     {
-        // We assume that we get path from self.file_keys, so we know that file
-        // exists
-        let data = match t_fs::read(path).await{
-            Ok(d) => d,
-            Err(e) => panic!("read_file_data - read func returned error: {e}")
-        };
-
-        if data.len() != SECTOR_SIZE
+        match access
         {
-            panic!("read_file_data - read data len ({}) is not equalt to SECTOR_SIZE ({}) - this shouldn't have happened", data.len(), SECTOR_SIZE);
+            FileAccess::FileDescr(f_descr) => {
+                let sector_vec = read_data_from_descr(f_descr).await;
+                return (sector_vec, None);
+            },
+            FileAccess::FilePath(path) => {
+                // We assume that we get path from self.file_keys, so we know that 
+                // file  exists, so this should never panic
+                let mut f = match t_fs::File::open(path).await {
+                    Ok(d) => d,
+                    Err(e) => panic!("read_file_data::File::open - returned error: {e}")
+                };
+                let sector_vec = read_data_from_descr(&mut f).await;
+
+                return (sector_vec, Some(f));
+            }
         }
-
-        // This should never panic because of above if
-        let data_arr: [u8; SECTOR_SIZE] = data.try_into().unwrap();
-
-        return SectorVec::new_from_slice(&data_arr);
     }
 
     /// *Panics* if file or directory doesn't exist
@@ -421,6 +293,8 @@ impl StableSectorManager
             .await
             .expect("remove_file - remove file system function failed");
 
+        // WE NEED TO ACQUIRE SEMAPHORE HERE
+
         // We need to sync directory 
         let dir = t_fs::File::open(root_dir)
             .await
@@ -429,5 +303,26 @@ impl StableSectorManager
         dir.sync_data()
             .await
             .expect("check_tmp_file - fdatasync failed on directory");
+
+        // AND HERE WE NEED TO RELEASE IT
     }
+}
+
+async fn read_data_from_descr(f: &mut t_fs::File) -> SectorVec
+{
+    let mut data: Vec<u8> = vec![0; SECTOR_SIZE];
+    let bytes_read = match f.read(&mut data).await {
+        Ok(d) => d,
+        Err(e) => panic!("read_file_data::f.read - returned error: {e}")
+    };
+
+    if bytes_read != SECTOR_SIZE
+    {
+        panic!("read_file_data - read data len ({}) is not equalt to SECTOR_SIZE ({}) - this shouldn't have happened", data.len(), SECTOR_SIZE);
+    }
+
+    // This should never panic because of above if
+    let data_arr: [u8; SECTOR_SIZE] = data.try_into().unwrap();
+
+    return SectorVec::new_from_slice(&data_arr);
 }
