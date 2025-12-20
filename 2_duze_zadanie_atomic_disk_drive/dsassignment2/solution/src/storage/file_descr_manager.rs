@@ -35,11 +35,15 @@ impl FileDescriptorManager
         if collections_lock.is_anyone_waiting_for_descr()
         {
             collections_lock.decrement_waiting_sectors();
-            collections_lock.remove_least_used_descritptor();
-            // We give one permit, even though number of opened file descriptors is
-            // at maximum, however, we know, that at least one of these descriptors
-            // is currently not being used
-            self.descr_semaphore.add_permits(1);
+            match collections_lock.remove_least_used_descritptor()
+            {
+                Some(old_permit) => {
+                    drop(old_permit);
+                }
+                None => {
+                    panic!("FileDescriptorManager::give_back_file_descr - after remove_least_used_descriptor we didn't get permit, this shouldn happen");
+                }
+            }
         }
         // collections_lock drop
     }
