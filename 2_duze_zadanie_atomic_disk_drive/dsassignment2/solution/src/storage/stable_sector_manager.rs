@@ -293,8 +293,6 @@ impl StableSectorManager
             .await
             .expect("remove_file - remove file system function failed");
 
-        // WE NEED TO ACQUIRE SEMAPHORE HERE
-
         // We need to sync directory 
         let dir = t_fs::File::open(root_dir)
             .await
@@ -303,8 +301,6 @@ impl StableSectorManager
         dir.sync_data()
             .await
             .expect("check_tmp_file - fdatasync failed on directory");
-
-        // AND HERE WE NEED TO RELEASE IT
     }
 }
 
