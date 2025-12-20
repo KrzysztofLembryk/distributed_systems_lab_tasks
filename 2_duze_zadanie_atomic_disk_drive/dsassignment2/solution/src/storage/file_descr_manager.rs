@@ -10,7 +10,6 @@ use crate::storage::storage_defs::{TimesUsed};
 
 pub struct FileDescriptorManager
 {
-    max_allowed_nbr_of_open_descr: usize,
     descr_semaphore: Semaphore,
     descr_collections: Mutex<DescrCollections>,
 }
@@ -20,7 +19,6 @@ impl FileDescriptorManager
     pub fn new(max_allowed_nbr_of_open_descr: usize) -> FileDescriptorManager
     {
         return FileDescriptorManager { 
-            max_allowed_nbr_of_open_descr, 
             descr_semaphore: Semaphore::new(max_allowed_nbr_of_open_descr),
             descr_collections: Mutex::new(
                 DescrCollections::new(max_allowed_nbr_of_open_descr)
@@ -46,7 +44,7 @@ impl FileDescriptorManager
         // collections_lock drop
     }
 
-    pub async fn get_file_descr(
+    pub async fn take_file_descr(
         &self, 
         sector_idx: SectorIdx,
         sector_path: &PathBuf
@@ -86,7 +84,7 @@ impl FileDescriptorManager
                                 // mutex and safely open new file_descr
                                 drop(collections_lock);
 
-                                let f = open_file_descr(sector_path).await;
+                                let f = open_or_create_file_descr(sector_path).await;
                                 return f;
                             },
                             None => {
@@ -134,7 +132,7 @@ impl FileDescriptorManager
                 // and open our file 
                 drop(collections_lock);
 
-                let f = open_file_descr(sector_path).await;
+                let f = open_or_create_file_descr(sector_path).await;
                 return f;
             },
             None => {
@@ -159,7 +157,7 @@ impl FileDescriptorManager
                 drop(collections_lock);
 
                 // and open file
-                let f = open_file_descr(sector_path).await;
+                let f = open_or_create_file_descr(sector_path).await;
                 return f;
             },
             None => {
@@ -180,7 +178,7 @@ impl FileDescriptorManager
                         // mutex and safely open new file_descr
                         drop(collections_lock);
 
-                        let f = open_file_descr(sector_path).await;
+                        let f = open_or_create_file_descr(sector_path).await;
                         return f;
                     },
                     None => {
@@ -360,10 +358,14 @@ impl DescrCollections
     }
 }
 
-async fn open_file_descr(sector_path: &PathBuf) -> t_fs::File
+async fn open_or_create_file_descr(sector_path: &PathBuf) -> t_fs::File
 {
-    let f = t_fs::File::open(sector_path)
+    let f = t_fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(sector_path)
         .await
-        .expect(&format!("open_file_descr: open failed for: {:?}", sector_path));
+        .expect(&format!("open_or_create_file: failed for {:?}", sector_path));
     return f;
 }

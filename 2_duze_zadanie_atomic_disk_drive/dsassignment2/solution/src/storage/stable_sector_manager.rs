@@ -1,5 +1,5 @@
 use tokio::fs as t_fs;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::{path::PathBuf};
 use sha2::{Sha256, Digest};
 
@@ -61,14 +61,22 @@ impl SectorsManager for StableSectorManager
 
                 // Explicit read lock drop before reading data from file
                 drop(sector_map_reader);
-
-                // Here we need to branch, if we have file descriptor we will use it
-                // otherwise we will use file path
-
+                
                 let file_name = create_file_name(idx, timestamp, writer_rank);
                 let file_path = self.root_dir.join(file_name);
 
-                return StableSectorManager::read_file_data(&file_path).await;
+                // We take file_descr for our sector from manager, it will take care
+                // of opening file, waiting for avaialble descr etc
+                let mut f = self.descr_manager
+                    .take_file_descr(idx, &file_path)
+                    .await;
+
+                let sector_vec = StableSectorManager::read_file_data(&mut f).await;
+
+                // We always need to return file_descr after taking it
+                self.descr_manager.give_back_file_descr(idx, f).await;
+
+                return sector_vec;
             }
         } // sector_map_reader dropped here
 
@@ -122,7 +130,21 @@ impl SectorsManager for StableSectorManager
         );
         let tmp_file_path = self.root_dir.join(&tmp_file_name);
 
-        StableSectorManager::save_data_to_file(data_to_write.as_slice(), &tmp_file_path, &self.root_dir).await;
+
+        // take_file_descr will reserve space for us and open or create file for us
+        let f = self.descr_manager.take_file_descr(sector_idx, &tmp_file_path).await;
+
+        // But we need to drop it immediately since now we will open tmp file
+        // And we are allowed to have ONE file descriptor open only, since that is 
+        // the number we reserved in descr_manager
+        drop(f);
+
+        // save_data_to_file closes all descriptors it opened
+        StableSectorManager::save_data_to_file(
+            data_to_write.as_slice(), 
+            &tmp_file_path, 
+            &self.root_dir)
+        .await;
 
         // #########################################################################
         // ######################### REMOVING OLD FILE #############################
@@ -164,6 +186,8 @@ impl SectorsManager for StableSectorManager
     
             if let Some(old_file_path) = old_file_path 
             {
+                // We don't have any file descriptor open, so we can safely use
+                // remove_file function
                 StableSectorManager::remove_file(&old_file_path, &self.root_dir).await;
             }
         }
@@ -181,6 +205,7 @@ impl SectorsManager for StableSectorManager
         );
         let dest_file_path = self.root_dir.join(&file_name);
 
+        // We don't have any descr open so we can safely use save_data_to_file
         StableSectorManager::save_data_to_file(data_to_write.as_slice(), &dest_file_path, &self.root_dir).await;
 
         // #########################################################################
@@ -190,7 +215,14 @@ impl SectorsManager for StableSectorManager
         // overwrite new_file
         // - if we crash during removing tmp_file we delete tmp_file and new_file 
         // remains
+
+        // We don't have any descr open so we can safely use remove_file
         StableSectorManager::remove_file(&tmp_file_path, &self.root_dir).await;
+
+        // We need to open result file, to give back file descriptor to descr manager
+        let res_f = t_fs::File::open(dest_file_path).await.unwrap();
+
+        self.descr_manager.give_back_file_descr(sector_idx, res_f).await;
     }
 }
 
@@ -222,29 +254,32 @@ impl StableSectorManager
     }
 
     /// Saves exactly SECTOR_SIZE bytes otherwise *panics*. <br>
-    /// If file or dir we write to doesn't exist it also *panics*.
+    /// If dir we write to doesn't exist it also *panics*. <br>
+    /// It closes all its file descriptors before returning
     async fn save_data_to_file(data: &[u8], path: &PathBuf, root_dir: &PathBuf)
     {
         if data.len() != SECTOR_SIZE
         {
-            panic!("RawFileManager::save_data_to_file - provided data len ({}) is not equal to SECTOR_SIZE ({})", data.len(), SECTOR_SIZE);
+            panic!("StableSectorManager::save_data_to_file - provided data len ({}) is not equal to SECTOR_SIZE ({})", data.len(), SECTOR_SIZE);
         }
         // We do everywhere 'expect' since these are filesystem operations
         // and if they fail we are expected to panic
 
-        // Write either creates or overwrites existing file
-        t_fs::write(&path, data)
-            .await
-            .expect("save_data_to_file - Failed to write file");
-
-        // We sync file to transfer it to disk
-        let file = t_fs::File::open(&path)
+        // We always overwrite file if it exists
+        let mut file = t_fs::File::create(&path)
             .await
             .expect("save_data_to_file - Failed to open file for sync");
+
+        file.write(data)
+            .await
+            .expect("save_data_to_file - Failed to write file");
 
         file.sync_data()
             .await
             .expect("save_data_to_file - fdatasync failed on file");
+
+        // At given moment we can have only one file descriptor open
+        drop(file);
 
         // We need to sync directory to ensure write happended
         let dir = t_fs::File::open(root_dir)
@@ -258,28 +293,12 @@ impl StableSectorManager
 
     /// Expects to read **exactly** SECTOR_SIZE bytes - otherwise *panics*. <br>
     /// If file for given path does not exist it also *panics*.
-    async fn read_file_data<'a>(
-        access: FileAccess<'a>
-    ) -> (SectorVec, Option<t_fs::File>)
+    async fn read_file_data(
+        f: &mut t_fs::File
+    ) -> SectorVec
     {
-        match access
-        {
-            FileAccess::FileDescr(f_descr) => {
-                let sector_vec = read_data_from_descr(f_descr).await;
-                return (sector_vec, None);
-            },
-            FileAccess::FilePath(path) => {
-                // We assume that we get path from self.file_keys, so we know that 
-                // file  exists, so this should never panic
-                let mut f = match t_fs::File::open(path).await {
-                    Ok(d) => d,
-                    Err(e) => panic!("read_file_data::File::open - returned error: {e}")
-                };
-                let sector_vec = read_data_from_descr(&mut f).await;
-
-                return (sector_vec, Some(f));
-            }
-        }
+        let sector_vec = read_data_from_descr(f).await;
+        return sector_vec;
     }
 
     /// *Panics* if file or directory doesn't exist
