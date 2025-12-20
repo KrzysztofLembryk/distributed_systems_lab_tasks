@@ -2,24 +2,24 @@ use tokio::fs as t_fs;
 use core::panic;
 use std::collections::{HashMap, BTreeSet};
 use std::path::PathBuf;
-use tokio::sync::MutexGuard;
-use tokio::sync::{Semaphore, Mutex};
+use tokio::sync::{MutexGuard, Mutex, Semaphore, OwnedSemaphorePermit};
+use std::sync::Arc;
 
 use crate::domain::{SectorIdx};
 use crate::storage::storage_defs::{TimesUsed};
 
 pub struct FileDescriptorManager
 {
-    descr_semaphore: Semaphore,
+    descr_semaphore: Arc<Semaphore>,
     descr_collections: Mutex<DescrCollections>,
 }
 
-impl FileDescriptorManager
+impl FileDescriptorManager 
 {
     pub fn new(max_allowed_nbr_of_open_descr: usize) -> FileDescriptorManager
     {
         return FileDescriptorManager { 
-            descr_semaphore: Semaphore::new(max_allowed_nbr_of_open_descr),
+            descr_semaphore: Arc::new(Semaphore::new(max_allowed_nbr_of_open_descr)),
             descr_collections: Mutex::new(
                 DescrCollections::new(max_allowed_nbr_of_open_descr)
             ),
@@ -62,14 +62,16 @@ impl FileDescriptorManager
                 // 1) We don't have open file descr in descr_map for this sector, 
                 // so check if we can create a new one, by trying to acquire 
                 // semaphore that counts how many descriptors we can open
-                match self.descr_semaphore.try_acquire()
+                // We do try_acquire since we don't want to wait on semaphore yet
+                match self.descr_semaphore.clone().try_acquire_owned()
                 {
-                    Ok(_) => {
+                    Ok(permit) => {
                         return FileDescriptorManager
                             ::handle_successful_semaphore_acquire(
                                 sector_idx, 
                                 sector_path, 
-                                &mut collections_lock
+                                collections_lock,
+                                permit
                             ).await;
                     },
                     Err(_) => {
@@ -96,19 +98,22 @@ impl FileDescriptorManager
 
                                 drop(collections_lock);
 
-                                self.descr_semaphore.acquire().await.unwrap();
+                                // we need to store permit, since if its dropped
+                                // semaphor increments --> WILL STORE IN HASHMAP
+                                let permit = self.descr_semaphore.clone().acquire_owned().await.unwrap();
 
                                 // We were woken up, this means there are some UNUSED
                                 // file descriptors, so we need to reclaim one of 
                                 // them
-                                let mut collections_lock = 
+                                let collections_lock = 
                                     self.descr_collections.lock().await;
 
                                 return FileDescriptorManager
                                     ::handle_reserve_after_wait(
                                         sector_idx, 
                                         sector_path, 
-                                        &mut collections_lock
+                                        collections_lock,
+                                        permit
                                 ).await;
                             }
                         }
@@ -122,10 +127,11 @@ impl FileDescriptorManager
     async fn handle_reserve_after_wait(
         sector_idx: SectorIdx,
         sector_path: &PathBuf,
-        collections_lock: &mut MutexGuard<'_, DescrCollections>
+        mut collections_lock: MutexGuard<'_, DescrCollections>,
+        permit: OwnedSemaphorePermit
     ) -> t_fs::File
     {
-        match collections_lock.try_reserve_file_descr(sector_idx)
+        match collections_lock.try_reserve_file_descr(sector_idx, permit)
         {
             Some(_) => {
                 // We reserved space for our descriptor so we can safely drop mutex 
@@ -144,11 +150,12 @@ impl FileDescriptorManager
     async fn handle_successful_semaphore_acquire(
         sector_idx: SectorIdx,
         sector_path: &PathBuf,
-        collections_lock: &mut MutexGuard<'_, DescrCollections>
+        mut collections_lock: MutexGuard<'_, DescrCollections>,
+        permit: OwnedSemaphorePermit
     ) -> t_fs::File
     {
         match collections_lock
-            .try_reserve_file_descr(sector_idx)
+            .try_reserve_file_descr(sector_idx, permit)
         {
             Some(_) => {
                 // place for our file descr was reserved, and we 
@@ -190,9 +197,12 @@ impl FileDescriptorManager
     }
 }
 
-struct DescrCollections
+struct DescrCollections 
 {
-    descr_map: HashMap<SectorIdx, (TimesUsed, Option<tokio::fs::File>)>,
+    descr_map: HashMap<
+        SectorIdx, 
+        (TimesUsed, Option<tokio::fs::File>, OwnedSemaphorePermit)
+    >,
     curr_used_descr: BTreeSet<(TimesUsed, SectorIdx)>,
     curr_not_used_descr: BTreeSet<(TimesUsed, SectorIdx)>,
     max_allowed_nbr_of_open_descr: usize,
@@ -200,7 +210,7 @@ struct DescrCollections
 
 }
 
-impl DescrCollections
+impl DescrCollections 
 {
     fn new(max_allowed_nbr_of_open_descr: usize) -> DescrCollections
     {
@@ -230,7 +240,7 @@ impl DescrCollections
 
     fn give_back_file_descr(&mut self, sector_idx: SectorIdx, f: t_fs::File)
     {
-        if let Some((usage_count, f_descr)) = self.descr_map.get_mut(&sector_idx)
+        if let Some((usage_count, f_descr, _permit)) = self.descr_map.get_mut(&sector_idx)
         {
             if !self.curr_used_descr.remove(&(*usage_count, sector_idx))
             {
@@ -260,7 +270,7 @@ impl DescrCollections
         sector_idx: SectorIdx
     ) -> Option<t_fs::File>
     {
-        if let Some((usage_count, f_descr)) = self.descr_map.get_mut(&sector_idx)
+        if let Some((usage_count, f_descr, _permit)) = self.descr_map.get_mut(&sector_idx)
         {
             // If we have file descriptor inside map, this means that semaphor for 
             // this descriptor was taken, and we can safely use it, and also that 
@@ -299,14 +309,15 @@ impl DescrCollections
     /// bottleneck
     fn try_reserve_file_descr(
         &mut self, 
-        sector_idx: SectorIdx
+        sector_idx: SectorIdx,
+        permit: OwnedSemaphorePermit
     ) -> Option<()>
     {
         if self.curr_not_used_descr.len() 
         + self.curr_used_descr.len() < self.max_allowed_nbr_of_open_descr
         {
             let usage_count: u64 = 0;
-            self.descr_map.insert(sector_idx, (usage_count, None));
+            self.descr_map.insert(sector_idx, (usage_count, None, permit));
             self.curr_used_descr.insert((usage_count, sector_idx));
 
             return Some(());
@@ -324,8 +335,8 @@ impl DescrCollections
     {
         match self.remove_least_used_descritptor()
         {
-            Some(_) => {
-                return self.try_reserve_file_descr(sector_idx);
+            Some(old_permit) => {
+                return self.try_reserve_file_descr(sector_idx, old_permit);
             },
             None => {
                 // All opened file descriptors are currently used, so we cannot open 
@@ -336,7 +347,7 @@ impl DescrCollections
         }
     }
 
-    fn remove_least_used_descritptor(&mut self) -> Option<()>
+    fn remove_least_used_descritptor(&mut self) -> Option<OwnedSemaphorePermit>
     {
         let least_used_descr = self.curr_not_used_descr.first();
 
@@ -344,7 +355,9 @@ impl DescrCollections
         {
             self.curr_not_used_descr.remove(&(use_count, least_used_sector_idx));
 
-            let (_, old_f_descr) = self.descr_map
+            // We remove least used descriptor BUT we save its permit, since now it
+            // will belong to the other sector
+            let (_, old_f_descr, old_permit) = self.descr_map
                 .remove(&least_used_sector_idx)
                 .expect(&format!("DescrCollections::try_reclaim_file_descr:: descriptor for sector '{}' was present in curr_not_used_descr set but not in descr_map", least_used_sector_idx));
 
@@ -352,7 +365,7 @@ impl DescrCollections
             drop(old_f_descr.expect(
                 &format!("DescrCollections::try_reclaim_file_descr - when trying to close descriptor for sector: '{}', it was NONE, but should be SOME", least_used_sector_idx)
             ));
-            return Some(());
+            return Some(old_permit);
         }
         return None;
     }
