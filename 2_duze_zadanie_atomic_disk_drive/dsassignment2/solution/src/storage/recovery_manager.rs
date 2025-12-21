@@ -1,10 +1,9 @@
 use tokio::fs as t_fs;
-use tokio::io::AsyncReadExt;
 use std::collections::{HashMap};
 use std::{path::PathBuf};
 use sha2::{Sha256, Digest};
 
-use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
+use crate::domain::{SECTOR_SIZE, SectorIdx};
 
 use crate::storage::storage_defs::{TimeStampType, WriterRankType, TMP_PREFIX};
 use crate::storage::storage_utils::{create_file_name, extract_data_from_temp_file_name, create_sector_idx_to_metadata_map};

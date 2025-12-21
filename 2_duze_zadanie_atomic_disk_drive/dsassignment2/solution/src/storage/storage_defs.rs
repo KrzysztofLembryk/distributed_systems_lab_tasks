@@ -8,7 +8,7 @@ use crate::domain::{SectorIdx};
 /// 2 * 491 is 982, so in worst scenario we have 42 free descriptors.
 /// We need them since at the same time we can have 16 TCP connections, each takes 
 /// one descriptor, and some OS reserved descriptors etc
-pub const MAX_AVAILABLE_FILE_DESCRIPTORS: usize = 980;
+pub const MAX_AVAILABLE_FILE_DESCRIPTORS: usize = 990;
 // pub const CHECKSUM_SIZE: usize = 32;
 pub const TMP_PREFIX: &str = "tmp";
 

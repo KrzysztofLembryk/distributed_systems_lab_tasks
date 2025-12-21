@@ -2,6 +2,8 @@ use tokio::fs as t_fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::{path::PathBuf};
 use sha2::{Sha256, Digest};
+use tokio::io::AsyncSeekExt;
+use std::io::SeekFrom;
 
 use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
 use crate::sectors_manager_public::{SectorsManager};
@@ -69,7 +71,10 @@ impl SectorsManager for StableSectorManager
 
                 let sector_vec = StableSectorManager::read_file_data(&mut f).await;
 
-                // We always need to return file_descr after taking it
+                // We always need to return file_descr after taking it, and since
+                // we read from it, we need to seek its start for next reads to be
+                // able to read whole data
+                f.seek(SeekFrom::Start(0)).await.expect("SectorsManager::read_data - f.seek start paniced");
                 self.descr_manager.give_back_file_descr(idx, f).await;
 
                 return sector_vec;

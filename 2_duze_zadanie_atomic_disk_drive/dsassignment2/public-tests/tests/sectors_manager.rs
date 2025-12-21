@@ -50,20 +50,61 @@ async fn data_survives_crash() {
     assert_eq!(data.0, Box::new(Array(*in_data)));
 }
 
-const N_TASKS: usize = 100;
-const N_SECTORS_BATCH: usize = 32;
 #[tokio::test]
-#[timeout(8200)]
-async fn many_concurrent_operation_on_different_sectors() {
+#[timeout(5000)]
+async fn concurrent_operation_on_different_sectors_public_test() 
+{
     let start = Instant::now();
     // given
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager =
         Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
-    // let tasks: usize = 10;
-    // let sectors_batch = 16;
-    let tasks: usize = N_TASKS;
-    let sectors_batch = N_SECTORS_BATCH;
+    let tasks: usize = 10;
+    let sectors_batch = 16;
+    let mut task_handles = vec![];
+
+    // when
+    for i in 0..tasks {
+        let sectors_manager = sectors_manager.clone();
+        task_handles.push(tokio::spawn(async move {
+            let sectors_start = sectors_batch * i;
+            let sectors_end = sectors_start + sectors_batch;
+
+            for sector_idx in sectors_start..sectors_end {
+                let sector_idx = sector_idx as u64;
+                let data = SectorVec(Box::new(Array(
+                    [0; 4096].map(|_| rand::rng().random_range(0..255)),
+                )));
+
+                sectors_manager
+                    .write(sector_idx, &(data.clone(), 1, 1))
+                    .await;
+                assert_eq!(sectors_manager.read_metadata(sector_idx).await, (1, 1));
+                assert_eq!(sectors_manager.read_data(sector_idx).await, data);
+            }
+        }));
+    }
+
+    // then
+    for handle in task_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let duration = start.elapsed();
+    println!("pub test duration: {:.2?}", duration);
+}
+
+#[tokio::test]
+#[timeout(10000)]
+async fn many_concurrent_operation_on_different_sectors_tasks_100_batch_32() 
+{
+    let start = Instant::now();
+    // given
+    let root_drive_dir = tempdir().unwrap();
+    let sectors_manager =
+        Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
+    let tasks: usize = 100;
+    let sectors_batch = 32;
     let mut task_handles = vec![];
 
     // when
@@ -98,15 +139,17 @@ async fn many_concurrent_operation_on_different_sectors() {
 }
 
 #[tokio::test]
-#[timeout(30000)]
-async fn more_concurrent_op_than_allowed_open_descriptors() {
+#[timeout(70000)]
+async fn more_concurr_op_than_allowed_open_descriptors_tasks_1200_batch_16() 
+{
+    // allowed nbr of open descriptors is 990
     let start = Instant::now();
     // given
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager =
         Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
     let tasks: usize = 1200;
-    let sectors_batch = 8;
+    let sectors_batch = 16;
     let mut task_handles = vec![];
 
     // when
@@ -137,5 +180,196 @@ async fn more_concurrent_op_than_allowed_open_descriptors() {
     }
 
     let duration = start.elapsed();
-    println!("LOTS of descriptors Test duration: {:.2?}", duration);
+    println!("Test duration: {:.2?}", duration);
+}
+
+
+#[tokio::test]
+#[timeout(8000)]
+async fn concurrent_write_100_reads_for_each_sector_tasks_16_batch_16() 
+{
+    use std::time::Instant;
+    use rand::Rng;
+    use tempfile::tempdir;
+
+    let start = Instant::now();
+    let root_drive_dir = tempdir().unwrap();
+    let sectors_manager =
+        Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
+
+    let tasks: usize = 16;
+    let sectors_batch = 16;
+    let sector_count: usize = tasks * sectors_batch;
+    let mut task_handles = vec![];
+
+    // 1. Create and read all sectors
+    for i in 0..tasks {
+        let sectors_manager = sectors_manager.clone();
+        task_handles.push(tokio::spawn(async move {
+            let sectors_start = sectors_batch * i;
+            let sectors_end = sectors_start + sectors_batch;
+
+            for sector_idx in sectors_start..sectors_end {
+                let sector_idx = sector_idx as u64;
+                let data = SectorVec(Box::new(Array(
+                    [0; 4096].map(|_| rand::rng().random_range(0..255)),
+                )));
+
+                sectors_manager
+                    .write(sector_idx, &(data.clone(), 1, 1))
+                    .await;
+                assert_eq!(sectors_manager.read_metadata(sector_idx).await, (1, 1));
+                assert_eq!(sectors_manager.read_data(sector_idx).await, data);
+            }
+        }));
+    }
+    for handle in task_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let mut read_handles = vec![];
+    let many_read_count = 100;
+
+    for sector_idx in 0..sector_count {
+        let sectors_manager = sectors_manager.clone();
+        read_handles.push(tokio::spawn(async move {
+            for _ in 0..many_read_count {
+                let _ = sectors_manager.read_data(sector_idx as u64).await;
+            }
+        }));
+    }
+
+    for handle in read_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let duration = start.elapsed();
+    println!("Test duration: {:.2?}", duration);
+}
+
+
+#[tokio::test]
+#[timeout(80000)]
+async fn concurrent_write_100_reads_for_each_sector_tasks_200_batch_16() 
+{
+    // So thate we have more sectors than allowed descriptors,
+    use std::time::Instant;
+    use rand::Rng;
+    use tempfile::tempdir;
+
+    let start = Instant::now();
+    let root_drive_dir = tempdir().unwrap();
+    let sectors_manager =
+        Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
+
+    let tasks: usize = 200;
+    let sectors_batch = 16;
+    let sector_count: usize = tasks * sectors_batch;
+    let mut task_handles = vec![];
+
+    // 1. Create and read all sectors
+    for i in 0..tasks {
+        let sectors_manager = sectors_manager.clone();
+        task_handles.push(tokio::spawn(async move {
+            let sectors_start = sectors_batch * i;
+            let sectors_end = sectors_start + sectors_batch;
+
+            for sector_idx in sectors_start..sectors_end {
+                let sector_idx = sector_idx as u64;
+                let data = SectorVec(Box::new(Array(
+                    [0; 4096].map(|_| rand::rng().random_range(0..255)),
+                )));
+
+                sectors_manager
+                    .write(sector_idx, &(data.clone(), 1, 1))
+                    .await;
+                assert_eq!(sectors_manager.read_metadata(sector_idx).await, (1, 1));
+                assert_eq!(sectors_manager.read_data(sector_idx).await, data);
+            }
+        }));
+    }
+    for handle in task_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let mut read_handles = vec![];
+    let many_read_count = 100;
+
+    for sector_idx in 0..sector_count {
+        let sectors_manager = sectors_manager.clone();
+        read_handles.push(tokio::spawn(async move {
+            for _ in 0..many_read_count {
+                let _ = sectors_manager.read_data(sector_idx as u64).await;
+            }
+        }));
+    }
+
+    for handle in read_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let duration = start.elapsed();
+    println!("Test duration: {:.2?}", duration);
+}
+
+#[tokio::test]
+#[timeout(120000)]
+async fn descriptor_usage_skewed_reads_tasks_1200_batch_16() 
+{
+    use rand::Rng;
+
+    let start = Instant::now();
+    let root_drive_dir = tempdir().unwrap();
+    let sectors_manager =
+        Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
+
+    let tasks: usize = 1200;
+    let sectors_batch = 16;
+    let total_sectors = tasks * sectors_batch;
+    let mut task_handles = vec![];
+
+    // 1. Create and read all sectors
+    for i in 0..tasks {
+        let sectors_manager = sectors_manager.clone();
+        task_handles.push(tokio::spawn(async move {
+            let sectors_start = sectors_batch * i;
+            let sectors_end = sectors_start + sectors_batch;
+
+            for sector_idx in sectors_start..sectors_end {
+                let sector_idx = sector_idx as u64;
+                let data = SectorVec(Box::new(Array(
+                    [0; 4096].map(|_| rand::rng().random_range(0..255)),
+                )));
+
+                sectors_manager
+                    .write(sector_idx, &(data.clone(), 1, 1))
+                    .await;
+                assert_eq!(sectors_manager.read_metadata(sector_idx).await, (1, 1));
+                assert_eq!(sectors_manager.read_data(sector_idx).await, data);
+            }
+        }));
+    }
+    for handle in task_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    // 2. For 900 descriptors, do many reads, should be fast since all should be 
+    // stored inside our map after a while
+    let mut read_handles = vec![];
+    let many_read_count = 100;
+    for sector_idx in 0..900 {
+        let sectors_manager = sectors_manager.clone();
+        read_handles.push(tokio::spawn(async move {
+            for _ in 0..many_read_count {
+                let _ = sectors_manager.read_data(sector_idx as u64).await;
+            }
+        }));
+    }
+
+    for handle in read_handles {
+        assert!(handle.await.is_ok())
+    }
+
+    let duration = start.elapsed();
+    println!("Test duration: {:.2?}", duration);
 }

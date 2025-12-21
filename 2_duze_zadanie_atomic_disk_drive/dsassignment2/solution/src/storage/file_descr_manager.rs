@@ -8,33 +8,10 @@ use std::sync::Arc;
 use crate::domain::{SectorIdx};
 use crate::storage::storage_defs::{TimesUsed};
 
-#[derive(Clone, Copy, PartialEq)]
-pub enum IoPhase
-{
-    // in write phase we don't want to open file descr
-    WritePhase,
-    ReadPhase
-}
+#[cfg(test)]
+#[path = "./storage_tests/test_file_descr_manager.rs"]
 
-impl IoPhase
-{
-    async fn handle_phase(&self, sector_path: &PathBuf) -> Option<t_fs::File>
-    {
-        match self
-        {
-            IoPhase::ReadPhase => {
-                // and open file
-                let f = open_or_create_file_descr(sector_path).await;
-                return Some(f);
-            },
-            IoPhase::WritePhase => {
-                // when write phase we only want to reserve space, not open
-                // f_descr since we won't use it at all
-                return None;
-            }
-        }
-    }
-}
+mod test_file_descr_manager;
 
 pub struct FileDescriptorManager
 {
@@ -133,6 +110,7 @@ impl FileDescriptorManager
 
                                 // we need to store permit, since if its dropped
                                 // semaphor increments --> WILL STORE IN HASHMAP
+
                                 let permit = self.descr_semaphore.clone().acquire_owned().await.unwrap();
 
                                 // We were woken up, this means there are some UNUSED
@@ -229,6 +207,12 @@ impl FileDescriptorManager
             }
         }
     }
+
+    async fn get_nbr_of_open_descr(&self) -> usize
+    {
+        let collections_lock = self.descr_collections.lock().await;
+        return collections_lock.descr_map.len()
+    }
 }
 
 struct DescrCollections 
@@ -260,11 +244,12 @@ impl DescrCollections
     fn increment_waiting_sectors(&mut self)
     {
         self.n_sectors_waiting += 1;
+
     }
 
     fn decrement_waiting_sectors(&mut self)
     {
-        self.n_sectors_waiting.checked_sub(1).expect("DescrCollections::decrement_waiting_sectors - decremented sectors when sectors waiting are 0");
+        self.n_sectors_waiting = self.n_sectors_waiting.checked_sub(1).expect("DescrCollections::decrement_waiting_sectors - decremented sectors when sectors waiting are 0");
     }
 
     fn is_anyone_waiting_for_descr(&self) -> bool
@@ -276,6 +261,7 @@ impl DescrCollections
     {
         if let Some((usage_count, f_descr, _permit)) = self.descr_map.get_mut(&sector_idx)
         {
+
             if !self.curr_used_descr.remove(&(*usage_count, sector_idx))
             {
                 panic!("DescrCollections::give_back_file_descr: When we wanted to remove (usage_count, sector_idx) = ({}, {}) from curr_used_descr set it was not present inside set, this shouldn't have happened", *usage_count, sector_idx);
@@ -311,7 +297,7 @@ impl DescrCollections
             // after ending last operation it was moved from used to free_descr set
             if !self.curr_not_used_descr.remove(&(*usage_count, sector_idx))
             {
-                panic!("DescrCollections::get_file_descr: When we wanter to remove (usage_count, sector_idx) = ({}, {}) from curr_free_descr set it was not present inside set, this shouldn't have happened", *usage_count, sector_idx);
+                panic!("DescrCollections::get_file_descr: When we wanted to remove (usage_count, sector_idx) = ({}, {}) from curr_not_used_descr set it was not present inside set, this shouldn't have happened", *usage_count, sector_idx);
             }
 
             // in f_descr we leave None
@@ -334,6 +320,7 @@ impl DescrCollections
                 }
             };
         }
+
         return None;
     }
 
@@ -347,15 +334,17 @@ impl DescrCollections
         permit: OwnedSemaphorePermit
     ) -> Option<()>
     {
+
         if self.curr_not_used_descr.len() 
         + self.curr_used_descr.len() < self.max_allowed_nbr_of_open_descr
         {
-            let usage_count: u64 = 0;
+            let usage_count: u64 = 1;
             self.descr_map.insert(sector_idx, (usage_count, None, permit));
             self.curr_used_descr.insert((usage_count, sector_idx));
 
             return Some(());
         }
+
         return None;
     }
 
@@ -383,7 +372,9 @@ impl DescrCollections
 
     fn remove_least_used_descritptor(&mut self) -> Option<OwnedSemaphorePermit>
     {
+
         let least_used_descr = self.curr_not_used_descr.first();
+
 
         if let Some(&(use_count, least_used_sector_idx)) = least_used_descr 
         {
@@ -415,4 +406,32 @@ async fn open_or_create_file_descr(sector_path: &PathBuf) -> t_fs::File
         .await
         .expect(&format!("open_or_create_file: failed for {:?}", sector_path));
     return f;
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum IoPhase
+{
+    // in write phase we don't want to open file descr
+    WritePhase,
+    ReadPhase
+}
+
+impl IoPhase
+{
+    async fn handle_phase(&self, sector_path: &PathBuf) -> Option<t_fs::File>
+    {
+        match self
+        {
+            IoPhase::ReadPhase => {
+                // and open file
+                let f = open_or_create_file_descr(sector_path).await;
+                return Some(f);
+            },
+            IoPhase::WritePhase => {
+                // when write phase we only want to reserve space, not open
+                // f_descr since we won't use it at all
+                return None;
+            }
+        }
+    }
 }
