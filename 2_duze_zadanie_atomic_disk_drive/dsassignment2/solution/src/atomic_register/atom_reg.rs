@@ -16,63 +16,6 @@ use crate::register_client_public::Send as RegSend;
 type TimestampType = u64;
 type WriterRankType = u8;
 type ProcIdx = u8;
-
-struct RegisterState
-{
-    timestamp: TimestampType, 
-    writer_rank: WriterRankType, 
-    register_val: SectorVec, 
-    readlist: HashMap<ProcIdx, (TimestampType, WriterRankType, SectorVec)>,
-    acklist: HashSet<ProcIdx>,
-    reading: bool,
-    writing: bool,
-    writeval: Option<SectorVec>,
-    readval: Option<SectorVec>,
-    write_phase: bool,
-    op_id: Option<Uuid>,
-}
-
-impl RegisterState
-{
-    fn new(
-        timestamp: TimestampType, 
-        writer_rank: WriterRankType, 
-        register_val: SectorVec, 
-    ) -> RegisterState
-    {
-        return RegisterState { 
-            timestamp, 
-            writer_rank, 
-            register_val, 
-            readlist: HashMap::new(), 
-            acklist: HashSet::new(), 
-            reading: false, 
-            writing: false, 
-            writeval: None, 
-            readval: None, 
-            write_phase: false,
-            op_id: None,
-        };
-    }
-
-    fn prepare_for_read(&mut self)
-    {
-        self.op_id = Some(Uuid::new_v4());
-        self.readlist.clear();
-        self.acklist.clear();
-        self.reading = true;
-    }
-
-    fn prepare_for_write(&mut self, val_to_write: SectorVec)
-    {
-        self.op_id = Some(Uuid::new_v4());
-        self.writeval = Some(val_to_write);
-        self.acklist.clear();
-        self.readlist.clear();
-        self.writing = true;
-    }
-}
-
 type SuccessCallbackFunc = Box<
             dyn FnOnce(ClientCommandResponse) 
                 -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,>;
@@ -446,5 +389,61 @@ impl AtomReg
 
             client_callback(response).await;
         }
+    }
+}
+
+struct RegisterState
+{
+    timestamp: TimestampType, 
+    writer_rank: WriterRankType, 
+    register_val: SectorVec, 
+    readlist: HashMap<ProcIdx, (TimestampType, WriterRankType, SectorVec)>,
+    acklist: HashSet<ProcIdx>,
+    reading: bool,
+    writing: bool,
+    writeval: Option<SectorVec>,
+    readval: Option<SectorVec>,
+    write_phase: bool,
+    op_id: Option<Uuid>,
+}
+
+impl RegisterState
+{
+    fn new(
+        timestamp: TimestampType, 
+        writer_rank: WriterRankType, 
+        register_val: SectorVec, 
+    ) -> RegisterState
+    {
+        return RegisterState { 
+            timestamp, 
+            writer_rank, 
+            register_val, 
+            readlist: HashMap::new(), 
+            acklist: HashSet::new(), 
+            reading: false, 
+            writing: false, 
+            writeval: None, 
+            readval: None, 
+            write_phase: false,
+            op_id: None,
+        };
+    }
+
+    fn prepare_for_read(&mut self)
+    {
+        self.op_id = Some(Uuid::new_v4());
+        self.readlist.clear();
+        self.acklist.clear();
+        self.reading = true;
+    }
+
+    fn prepare_for_write(&mut self, val_to_write: SectorVec)
+    {
+        self.op_id = Some(Uuid::new_v4());
+        self.writeval = Some(val_to_write);
+        self.acklist.clear();
+        self.readlist.clear();
+        self.writing = true;
     }
 }

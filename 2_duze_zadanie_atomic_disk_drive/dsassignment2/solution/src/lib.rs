@@ -1,6 +1,6 @@
 mod domain;
 mod storage;
-mod atomic_reg;
+mod atomic_register;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -19,6 +19,7 @@ pub mod atomic_register_public {
         ClientCommandResponse, ClientRegisterCommand, RegisterClient, SectorIdx, SectorsManager,
         SystemRegisterCommand,
     };
+    use crate::atomic_register::atom_reg::AtomReg;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -63,8 +64,15 @@ pub mod atomic_register_public {
         register_client: Arc<dyn RegisterClient>,
         sectors_manager: Arc<dyn SectorsManager>,
         processes_count: u8,
-    ) -> Box<dyn AtomicRegister> {
-        unimplemented!()
+    ) -> Box<dyn AtomicRegister> 
+    {
+        return Box::new(AtomReg::new(
+            self_ident, 
+            sector_idx, 
+            register_client, 
+            sectors_manager, 
+            processes_count
+        ).await);
     }
 }
 
