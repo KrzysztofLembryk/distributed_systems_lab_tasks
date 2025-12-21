@@ -7,6 +7,7 @@ use crate::domain::{SECTOR_SIZE, SectorIdx, SectorVec};
 use crate::storage::storage_utils::{create_file_name, create_temp_file_name};
 use crate::storage::stable_sector_manager::StableSectorManager;
 use crate::storage::storage_defs::{SectorRwHashMap};
+use crate::storage::file_descr_manager::{FileDescriptorManager, IoPhase};
 
 const SECTOR_IDX: SectorIdx = 1;
 const TIMESTAMP: u64 = 42;
@@ -27,6 +28,7 @@ async fn test_write_crash_before_create_tmp_file()
     let root_dir = tempdir().unwrap();
     let root_path = root_dir.path().to_path_buf();
     let mut sector_map = SectorRwHashMap::default();
+    let mut descr_manager = FileDescriptorManager::new(10);
 
     let old_data = [1u8; SECTOR_SIZE];
 
@@ -36,7 +38,7 @@ async fn test_write_crash_before_create_tmp_file()
     let new_data = SectorVec::new_from_slice(&[2u8; SECTOR_SIZE]);
     let new_ts = TIMESTAMP + 1;
     let new_wr = WRITER_RANK;
-    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeCreateTmpFile).await;
+    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeCreateTmpFile, &mut descr_manager).await;
 
     // Recover
     let manager = StableSectorManager::recover(root_path.clone()).await;
@@ -55,6 +57,7 @@ async fn test_write_crash_before_remove_old_file()
     let root_dir = tempdir().unwrap();
     let root_path = root_dir.path().to_path_buf();
     let mut sector_map = SectorRwHashMap::default();
+    let mut descr_manager = FileDescriptorManager::new(10);
 
     let old_data = [1u8; SECTOR_SIZE];
 
@@ -64,7 +67,7 @@ async fn test_write_crash_before_remove_old_file()
     let new_data = SectorVec::new_from_slice(&[2u8; SECTOR_SIZE]);
     let new_ts = TIMESTAMP + 1;
     let new_wr = WRITER_RANK;
-    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeRmvOldFile).await;
+    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeRmvOldFile, &mut descr_manager).await;
 
     // Recover
     let manager = StableSectorManager::recover(root_path.clone()).await;
@@ -83,6 +86,7 @@ async fn test_write_crash_before_save_new_file()
     let root_dir = tempdir().unwrap();
     let root_path = root_dir.path().to_path_buf();
     let mut sector_map = SectorRwHashMap::default();
+    let mut descr_manager = FileDescriptorManager::new(10);
 
     let old_data = [1u8; SECTOR_SIZE];
 
@@ -92,7 +96,7 @@ async fn test_write_crash_before_save_new_file()
     let new_data = SectorVec::new_from_slice(&[2u8; SECTOR_SIZE]);
     let new_ts = TIMESTAMP + 1;
     let new_wr = WRITER_RANK;
-    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeSaveNewFile).await;
+    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeSaveNewFile, &mut descr_manager).await;
 
     // Recover
     let manager = StableSectorManager::recover(root_path.clone()).await;
@@ -111,6 +115,7 @@ async fn test_write_crash_before_remove_tmp_file()
     let root_dir = tempdir().unwrap();
     let root_path = root_dir.path().to_path_buf();
     let mut sector_map = SectorRwHashMap::default();
+    let mut descr_manager = FileDescriptorManager::new(10);
 
     let old_data = [1u8; SECTOR_SIZE];
 
@@ -120,7 +125,7 @@ async fn test_write_crash_before_remove_tmp_file()
     let new_data = SectorVec::new_from_slice(&[2u8; SECTOR_SIZE]);
     let new_ts = TIMESTAMP + 1;
     let new_wr = WRITER_RANK;
-    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeRmvTmpFile).await;
+    write(SECTOR_IDX, &(new_data.clone(), new_ts, new_wr), &mut sector_map, &root_path, CrashMoment::BeforeRmvTmpFile, &mut descr_manager).await;
 
     // Recover
     let manager = StableSectorManager::recover(root_path.clone()).await;
@@ -158,20 +163,20 @@ async fn write(
     sector_idx: SectorIdx, sector: &(SectorVec, u64, u8),
     sector_map: &mut SectorRwHashMap,
     root_dir: &PathBuf,
-    crash_moment: CrashMoment
+    crash_moment: CrashMoment,
+    descr_manager: &mut FileDescriptorManager
 )
 {
+    if crash_moment == CrashMoment::BeforeCreateTmpFile
+    {
+        return;
+    }
     // #########################################################################
     // ########################## SAVING TEMP FILE #############################
     // #########################################################################
     // - If we crash before saving tmp_file we will recover from old_file
     // - If we crash while saving tmp_file, checksum of temp file will be wrong,
     // we will delete tmp_file so only old_file will remain (if it exists)
-
-    if crash_moment == CrashMoment::BeforeCreateTmpFile
-    {
-        return;
-    }
 
     let (data_to_write, new_timestamp, new_writer_rank) = sector;
     let data_checksum: String = 
@@ -182,13 +187,30 @@ async fn write(
     );
     let tmp_file_path = root_dir.join(&tmp_file_name);
 
-    StableSectorManager::save_data_to_file(data_to_write.as_slice(), &tmp_file_path, root_dir).await;
+
+    // take_file_descr will reserve space for us and open or create file for us
+    let f = descr_manager.take_file_descr(sector_idx, &tmp_file_path, IoPhase::WritePhase).await;
+
+    // But we need to drop it immediately since now we will open tmp file
+    // And we are allowed to have ONE file descriptor open only, since that is 
+    // the number we reserved in descr_manager
+    match f
+    {
+        Some(f) => {drop(f)},
+        None => {}
+    }
+
+    // save_data_to_file closes all descriptors it opened
+    StableSectorManager::save_data_to_file(
+        data_to_write.as_slice(), 
+        &tmp_file_path, 
+        root_dir)
+    .await;
 
     if crash_moment == CrashMoment::BeforeRmvOldFile
     {
         return;
     }
-
     // #########################################################################
     // ######################### REMOVING OLD FILE #############################
     // #########################################################################
@@ -229,6 +251,8 @@ async fn write(
 
         if let Some(old_file_path) = old_file_path 
         {
+            // We don't have any file descriptor open, so we can safely use
+            // remove_file function
             StableSectorManager::remove_file(&old_file_path, root_dir).await;
         }
     }
@@ -250,6 +274,7 @@ async fn write(
     );
     let dest_file_path = root_dir.join(&file_name);
 
+    // We don't have any descr open so we can safely use save_data_to_file
     StableSectorManager::save_data_to_file(data_to_write.as_slice(), &dest_file_path, root_dir).await;
 
     if crash_moment == CrashMoment::BeforeRmvTmpFile
@@ -263,5 +288,12 @@ async fn write(
     // overwrite new_file
     // - if we crash during removing tmp_file we delete tmp_file and new_file 
     // remains
+
+    // We don't have any descr open so we can safely use remove_file
     StableSectorManager::remove_file(&tmp_file_path, root_dir).await;
+
+    // We need to open result file, to give back file descriptor to descr manager
+    let res_f = tokio::fs::File::open(dest_file_path).await.unwrap();
+
+    descr_manager.give_back_file_descr(sector_idx, res_f).await;
 }

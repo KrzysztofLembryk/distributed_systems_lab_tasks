@@ -8,6 +8,34 @@ use std::sync::Arc;
 use crate::domain::{SectorIdx};
 use crate::storage::storage_defs::{TimesUsed};
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum IoPhase
+{
+    // in write phase we don't want to open file descr
+    WritePhase,
+    ReadPhase
+}
+
+impl IoPhase
+{
+    async fn handle_phase(&self, sector_path: &PathBuf) -> Option<t_fs::File>
+    {
+        match self
+        {
+            IoPhase::ReadPhase => {
+                // and open file
+                let f = open_or_create_file_descr(sector_path).await;
+                return Some(f);
+            },
+            IoPhase::WritePhase => {
+                // when write phase we only want to reserve space, not open
+                // f_descr since we won't use it at all
+                return None;
+            }
+        }
+    }
+}
+
 pub struct FileDescriptorManager
 {
     descr_semaphore: Arc<Semaphore>,
@@ -51,8 +79,9 @@ impl FileDescriptorManager
     pub async fn take_file_descr(
         &self, 
         sector_idx: SectorIdx,
-        sector_path: &PathBuf
-    ) -> t_fs::File
+        sector_path: &PathBuf,
+        io_phase: IoPhase
+    ) -> Option<t_fs::File>
     {
         let mut collections_lock = self.descr_collections.lock().await;
 
@@ -60,7 +89,7 @@ impl FileDescriptorManager
         match collections_lock.try_retrieve_file_descr(sector_idx)
         {
             Some(f) => {
-                return f;
+                return Some(f);
             },
             None => {
                 // 1) We don't have open file descr in descr_map for this sector, 
@@ -75,7 +104,8 @@ impl FileDescriptorManager
                                 sector_idx, 
                                 sector_path, 
                                 collections_lock,
-                                permit
+                                permit,
+                                io_phase
                             ).await;
                     },
                     Err(_) => {
@@ -90,8 +120,7 @@ impl FileDescriptorManager
                                 // mutex and safely open new file_descr
                                 drop(collections_lock);
 
-                                let f = open_or_create_file_descr(sector_path).await;
-                                return f;
+                                return io_phase.handle_phase(sector_path).await;
                             },
                             None => {
                                 // 3) There is no available permit and all 
@@ -117,7 +146,8 @@ impl FileDescriptorManager
                                         sector_idx, 
                                         sector_path, 
                                         collections_lock,
-                                        permit
+                                        permit,
+                                        io_phase
                                 ).await;
                             }
                         }
@@ -132,8 +162,9 @@ impl FileDescriptorManager
         sector_idx: SectorIdx,
         sector_path: &PathBuf,
         mut collections_lock: MutexGuard<'_, DescrCollections>,
-        permit: OwnedSemaphorePermit
-    ) -> t_fs::File
+        permit: OwnedSemaphorePermit,
+        io_phase: IoPhase
+    ) -> Option<t_fs::File>
     {
         match collections_lock.try_reserve_file_descr(sector_idx, permit)
         {
@@ -142,8 +173,7 @@ impl FileDescriptorManager
                 // and open our file 
                 drop(collections_lock);
 
-                let f = open_or_create_file_descr(sector_path).await;
-                return f;
+                return io_phase.handle_phase(sector_path).await;
             },
             None => {
                 panic!("FileDescriptorManager::handle_reserve_after_wait - we acquired semaphore, there should be free space to reserve file descr, but there is not");
@@ -155,8 +185,9 @@ impl FileDescriptorManager
         sector_idx: SectorIdx,
         sector_path: &PathBuf,
         mut collections_lock: MutexGuard<'_, DescrCollections>,
-        permit: OwnedSemaphorePermit
-    ) -> t_fs::File
+        permit: OwnedSemaphorePermit,
+        io_phase: IoPhase
+    ) -> Option<t_fs::File>
     {
         match collections_lock
             .try_reserve_file_descr(sector_idx, permit)
@@ -167,9 +198,9 @@ impl FileDescriptorManager
                 // mutex here 
                 drop(collections_lock);
 
-                // and open file
-                let f = open_or_create_file_descr(sector_path).await;
-                return f;
+                // if we read we open file, if write we don't open it since it won't
+                // be needed
+                return io_phase.handle_phase(sector_path).await;
             },
             None => {
                 // This probably should never happen since Semaphores
@@ -189,8 +220,7 @@ impl FileDescriptorManager
                         // mutex and safely open new file_descr
                         drop(collections_lock);
 
-                        let f = open_or_create_file_descr(sector_path).await;
-                        return f;
+                        return io_phase.handle_phase(sector_path).await;
                     },
                     None => {
                         panic!("FileDescriptorManager::handle_successful_sem_acquire - we acquired semaphore, there was no free space to reserve file descr, but there should be unused descriptors, but after try_reclaim we couldn't reclaim unused semaphore");

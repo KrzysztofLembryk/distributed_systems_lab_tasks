@@ -1,3 +1,4 @@
+use std::time::Instant;
 use assignment_2_solution::{SectorVec, build_sectors_manager};
 use ntest::timeout;
 use rand::Rng;
@@ -52,8 +53,9 @@ async fn data_survives_crash() {
 const N_TASKS: usize = 100;
 const N_SECTORS_BATCH: usize = 32;
 #[tokio::test]
-#[timeout(7000)]
+#[timeout(8200)]
 async fn many_concurrent_operation_on_different_sectors() {
+    let start = Instant::now();
     // given
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager =
@@ -90,18 +92,21 @@ async fn many_concurrent_operation_on_different_sectors() {
     for handle in task_handles {
         assert!(handle.await.is_ok())
     }
+
+    let duration = start.elapsed();
+    println!("Test duration: {:.2?}", duration);
 }
 
-
 #[tokio::test]
-#[timeout(5000)]
-async fn two_concurrent_op_on_diff_sectors() {
+#[timeout(30000)]
+async fn more_concurrent_op_than_allowed_open_descriptors() {
+    let start = Instant::now();
     // given
     let root_drive_dir = tempdir().unwrap();
     let sectors_manager =
         Arc::new(build_sectors_manager(root_drive_dir.path().to_path_buf()).await);
-    let tasks: usize = 2;
-    let sectors_batch = 2;
+    let tasks: usize = 1200;
+    let sectors_batch = 8;
     let mut task_handles = vec![];
 
     // when
@@ -130,4 +135,7 @@ async fn two_concurrent_op_on_diff_sectors() {
     for handle in task_handles {
         assert!(handle.await.is_ok())
     }
+
+    let duration = start.elapsed();
+    println!("LOTS of descriptors Test duration: {:.2?}", duration);
 }

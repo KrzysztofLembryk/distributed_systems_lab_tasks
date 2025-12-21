@@ -8,7 +8,7 @@ use crate::sectors_manager_public::{SectorsManager};
 use crate::storage::recovery_manager::RecoveryManager;
 use crate::storage::storage_defs::{SectorRwHashMap, MAX_AVAILABLE_FILE_DESCRIPTORS};
 use crate::storage::storage_utils::{create_file_name, create_temp_file_name, scan_dir_and_create_file_name_to_path_map};
-use crate::storage::file_descr_manager::{FileDescriptorManager};
+use crate::storage::file_descr_manager::{FileDescriptorManager, IoPhase};
 
 
 #[cfg(test)]
@@ -17,14 +17,9 @@ use crate::storage::file_descr_manager::{FileDescriptorManager};
 mod test_stable_sector_manager_recover;
 
 #[cfg(test)]
-#[path = "./storage_tests/test_stable_sector_manager_write.rs"]
-mod test_stable_sector_manager_write;
+#[path = "./storage_tests/test_stable_sector_manager_write_crash.rs"]
+mod test_stable_sector_manager_write_crash;
 
-enum FileAccess<'a>
-{
-    FilePath(&'a PathBuf),
-    FileDescr(&'a mut tokio::fs::File)
-}
 
 // ################################ FILE NAME FORMAT ################################
 // For normal files: "SectorIdx_timestamp_writeRank"
@@ -68,8 +63,9 @@ impl SectorsManager for StableSectorManager
                 // We take file_descr for our sector from manager, it will take care
                 // of opening file, waiting for avaialble descr etc
                 let mut f = self.descr_manager
-                    .take_file_descr(idx, &file_path)
-                    .await;
+                    .take_file_descr(idx, &file_path, IoPhase::ReadPhase)
+                    .await
+                    .expect("SecotrsManager::read_data - descr_manager.take_file_descr returned None for ReadPhase, this should never happen");
 
                 let sector_vec = StableSectorManager::read_file_data(&mut f).await;
 
@@ -131,13 +127,28 @@ impl SectorsManager for StableSectorManager
         let tmp_file_path = self.root_dir.join(&tmp_file_name);
 
 
-        // take_file_descr will reserve space for us and open or create file for us
-        let f = self.descr_manager.take_file_descr(sector_idx, &tmp_file_path).await;
+        // take_file_descr will reserve space for us 
+        // If file decsriptor was present, it will return it for us, if it wasnt
+        // it won't create one since in WritePhase we don't need to do that
+        let f = self.descr_manager
+            .take_file_descr(
+                sector_idx, 
+                &tmp_file_path, 
+                IoPhase::WritePhase
+            ).await;
 
-        // But we need to drop it immediately since now we will open tmp file
-        // And we are allowed to have ONE file descriptor open only, since that is 
-        // the number we reserved in descr_manager
-        drop(f);
+        // If descr was returned we need to drop it immediately since now we will 
+        // open tmp file. And we are allowed to have only ONE file descriptor open 
+        // at given time, since that is the number we reserved in descr_manager
+        match f
+        {
+            Some(f) => {
+                drop(f);
+            }
+            None => {
+
+            }
+        }
 
         // save_data_to_file closes all descriptors it opened
         StableSectorManager::save_data_to_file(

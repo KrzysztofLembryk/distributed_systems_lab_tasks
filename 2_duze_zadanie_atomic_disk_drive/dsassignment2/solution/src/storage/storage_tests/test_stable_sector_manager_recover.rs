@@ -205,7 +205,6 @@ async fn test_recover_from_corrupted_tmp_file_and_old_file()
     assert_eq!(read_writer_rank, WRITER_RANK);
 }
 
-
 #[tokio::test]
 #[timeout(500)]
 async fn test_recover_many_files_various_states() 
