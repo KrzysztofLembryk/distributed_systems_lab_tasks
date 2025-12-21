@@ -1,5 +1,6 @@
 mod domain;
 mod storage;
+mod atomic_reg;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -653,9 +654,28 @@ pub mod register_client_public {
         pub cmd: Arc<SystemRegisterCommand>,
     }
 
+    impl Broadcast
+    {
+        pub fn new(sys_cmd: SystemRegisterCommand) -> Broadcast
+        {
+            return Broadcast { cmd: Arc::new(sys_cmd) };
+        }
+    }
+
     pub struct Send {
         pub cmd: Arc<SystemRegisterCommand>,
         /// Identifier of the target process. Those start at 1.
         pub target: u8,
+    }
+
+    impl Send
+    {
+        pub fn new(sys_cmd: SystemRegisterCommand, target: u8) -> Send
+        {
+            return Send {
+                cmd: Arc::new(sys_cmd),
+                target: target
+            };
+        }
     }
 }
