@@ -57,13 +57,13 @@ impl RegisterClient for RegClient
                 target, 
                 cmd.clone(), 
                 TcpSendType::TcpNormalSend
-            );
+            ).await;
         }
         else
         {
             if let Some(tcp_tx) = &self.tcp_task_tx_map.get(&target)
             {
-                tcp_tx.send(cmd.clone());
+                tcp_tx.send(cmd.clone()).unwrap();
             }
             else
             {
@@ -151,7 +151,7 @@ impl RegClient
         // When doing broadcast we send msg to our sector skipping TCP part
         if let Some(sector_tx) = sector_tx_lock.get(&sector_idx)
         {
-            sector_tx.send(cmd);
+            sector_tx.send(cmd).unwrap();
             drop(sector_tx_lock);
         }
         else
@@ -162,7 +162,7 @@ impl RegClient
 
             if let Some(sector_tx) = newly_created_sector_lock.remove(&sector_idx)
             {
-                sector_tx.send(cmd);
+                sector_tx.send(cmd).unwrap();
                 sector_tx_lock.insert(sector_idx, sector_tx);
                 drop(newly_created_sector_lock);
                 drop(sector_tx_lock);

@@ -1,7 +1,7 @@
 mod domain;
 mod storage;
 mod atomic_register;
-mod register_process;
+mod atomic_disc_drive;
 mod register_client;
 
 pub use crate::domain::*;
@@ -108,8 +108,11 @@ pub mod sectors_manager_public {
 }
 
 pub mod transfer_public {
-    use crate::{ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SECTOR_SIZE, SectorVec, SystemCommandHeader, SystemRegisterCommandContent, SystemRegisterCommand};
-    use bincode::error::{DecodeError, EncodeError};
+    use crate::{ClientCommandHeader, ClientRegisterCommand, 
+        ClientRegisterCommandContent, RegisterCommand, SECTOR_SIZE, SectorVec, SystemCommandHeader, SystemRegisterCommandContent, SystemRegisterCommand,
+        ClientCommandResponse
+    };
+    use bincode::{enc, error::{DecodeError, EncodeError}};
     use sha2::Sha256;
     use std::io::Error;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -237,6 +240,38 @@ pub mod transfer_public {
             }
         }
         return Ok(());
+    }
+
+    pub async fn serialize_client_response(
+        cmd: &ClientCommandResponse,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), EncodingError> 
+    {
+        if hmac_key.len() != HMAC_CLIENT_KEY_SIZE
+        {
+            return Err(EncodingError::BincodeError(
+                EncodeError::Other(
+                    "During serialization of ClientCommandResponse provided hmac_key has size not equal to expected size: 32"
+            )));
+        }
+        let payload = cmd.encode();
+        let msg_size: u64 = (payload.len() + HMAC_TAG_SIZE) as u64;
+
+        let mut mac = HmacSha256::new_from_slice(hmac_key).unwrap();
+        mac.update(&payload);
+        let hmac_tag = mac.finalize().into_bytes();
+
+        let mut encoded_cmd: Vec<u8> = Vec::new();
+        encoded_cmd.extend_from_slice(&msg_size.to_be_bytes());
+        encoded_cmd.extend_from_slice(&payload);
+        encoded_cmd.extend_from_slice(&hmac_tag);
+
+        match writer.write_all(&encoded_cmd).await
+        {
+            Ok(_) => {return Ok(());},
+            Err(e) => {return Err(EncodingError::IoError(e));}
+        }
     }
 
     async fn deserialize_system_cmd<'a> (
@@ -368,7 +403,6 @@ pub mod transfer_public {
         reader: &'a mut CmdDeserializer<'a>
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
-        debug!("deserialize_client_cmd - start");
         // --------------
         // READING HEADER
         // --------------
@@ -434,7 +468,7 @@ pub mod transfer_public {
         }
         // TODO: should we check if reader.read_u8 returns error 
         // here? This would indicate that there is still some data
-        // so the message is wrong
+        // so the message is wrong - but this is STREAM so there might be more data
 
         return Ok(
             (

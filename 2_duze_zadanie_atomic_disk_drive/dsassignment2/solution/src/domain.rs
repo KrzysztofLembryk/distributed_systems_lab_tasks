@@ -254,6 +254,41 @@ pub struct ClientCommandResponse {
     pub op_return: OperationReturn,
 }
 
+const RESPONSE_OP_READ: u8 = 0;
+const RESPONSE_OP_WRITE: u8 = 1;
+
+impl ClientCommandResponse
+{
+    pub fn encode(&self) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.push(self.status as u8);
+        bytes.extend_from_slice(&self.request_identifier.to_be_bytes());
+
+        match &self.op_return
+        {
+            OperationReturn::Read { read_data } => {
+                bytes.push(RESPONSE_OP_READ);
+                match self.status
+                {
+                    StatusCode::Ok => {
+                        bytes.extend_from_slice(read_data.as_slice());
+                    },
+                    _ => {
+                        // as data we push zero values
+                    }
+                }
+
+            },
+            OperationReturn::Write => {
+                bytes.push(RESPONSE_OP_WRITE);
+            }
+        }
+
+        return bytes;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OperationReturn {
     /// Response for the `Read` command with sector data
