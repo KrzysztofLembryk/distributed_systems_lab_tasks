@@ -116,6 +116,9 @@ pub enum SystemRegisterCommandContent {
     },
     /// Acknowledgement of the processing completion
     Ack,
+    // MsgRecvAck {
+    //     msg_type: 
+    // },
 }
 
 pub const SYS_READ_PROC_CMD_ID: u32 = 0;

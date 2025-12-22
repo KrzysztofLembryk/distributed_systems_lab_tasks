@@ -1,6 +1,8 @@
 mod domain;
 mod storage;
 mod atomic_register;
+mod register_process;
+mod register_client;
 
 pub use crate::domain::*;
 pub use atomic_register_public::*;
@@ -9,8 +11,9 @@ pub use sectors_manager_public::*;
 pub use transfer_public::*;
 
 pub async fn run_register_process(config: Configuration) {
-    // I get config here, and from config I need to create a register process
-    // Each process will communicate with other processes by TCP
+    let system_hmac_key = config.hmac_system_key;
+    let client_hamc_key = config.hmac_client_key;
+    let public_config = config.public;
     unimplemented!()
 }
 

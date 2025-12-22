@@ -349,45 +349,54 @@ impl AtomReg
         recv_header: &SystemCommandHeader
     )
     {
-        self.reg_state.acklist.insert(recv_header.process_identifier);
-
-        if self.reg_state.acklist.len() > (self.processes_count / 2) as usize
-        && (self.reg_state.reading || self.reg_state.writing)
+        if let Some(op_id) = self.reg_state.op_id
         {
-            let client_callback: SuccessCallbackFunc = self.success_callback
-                .take()
-                .expect("AtomReg::handle_ack - self.success_callback is NONE, but it shouldn't be since we need to send result to client");
-
-            self.reg_state.acklist.clear();
-            self.reg_state.write_phase = false;
-            let request_id = self.client_request_id.take().expect("AtomReg::handle_ack - client_request_id is NONE, but it shouldn't be");
-            let response: ClientCommandResponse;
-
-            if self.reg_state.reading
+            if op_id != recv_header.msg_ident 
+            || !self.reg_state.write_phase
             {
-                self.reg_state.reading = false;
-                let readval = self.reg_state.readval
-                .take()
-                .expect("AtomReg::handle_ack - self.reg_state.readval is NONE but it shouldn't be since we are responding to READ request");
-
-                response = ClientCommandResponse {
-                    status: StatusCode::Ok,
-                    request_identifier: request_id,
-                    op_return: OperationReturn::Read { read_data: readval  }
-                };
-            }
-            else
-            {
-                self.reg_state.writing = false;
-
-                response = ClientCommandResponse {
-                    status: StatusCode::Ok,
-                    request_identifier: request_id,
-                    op_return: OperationReturn::Write 
-                };
+                return;
             }
 
-            client_callback(response).await;
+            self.reg_state.acklist.insert(recv_header.process_identifier);
+    
+            if self.reg_state.acklist.len() > (self.processes_count / 2) as usize
+            && (self.reg_state.reading || self.reg_state.writing)
+            {
+                let client_callback: SuccessCallbackFunc = self.success_callback
+                    .take()
+                    .expect("AtomReg::handle_ack - self.success_callback is NONE, but it shouldn't be since we need to send result to client");
+    
+                self.reg_state.acklist.clear();
+                self.reg_state.write_phase = false;
+                let request_id = self.client_request_id.take().expect("AtomReg::handle_ack - client_request_id is NONE, but it shouldn't be");
+                let response: ClientCommandResponse;
+    
+                if self.reg_state.reading
+                {
+                    self.reg_state.reading = false;
+                    let readval = self.reg_state.readval
+                    .take()
+                    .expect("AtomReg::handle_ack - self.reg_state.readval is NONE but it shouldn't be since we are responding to READ request");
+    
+                    response = ClientCommandResponse {
+                        status: StatusCode::Ok,
+                        request_identifier: request_id,
+                        op_return: OperationReturn::Read { read_data: readval  }
+                    };
+                }
+                else
+                {
+                    self.reg_state.writing = false;
+    
+                    response = ClientCommandResponse {
+                        status: StatusCode::Ok,
+                        request_identifier: request_id,
+                        op_return: OperationReturn::Write 
+                    };
+                }
+    
+                client_callback(response).await;
+            }
         }
     }
 }

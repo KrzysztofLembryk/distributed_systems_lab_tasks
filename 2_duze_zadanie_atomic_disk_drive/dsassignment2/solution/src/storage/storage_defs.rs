@@ -2,13 +2,9 @@ use tokio::sync::RwLock;
 use std::collections::HashMap;
 use crate::domain::{SectorIdx};
 
-/// While doing WRITE we have open descriptor for both old file and tmp file,
-/// so if we get more than 500 WRITE requests, we would have more than 1024 open 
-/// descriptors which would crash our programme.
-/// 2 * 491 is 982, so in worst scenario we have 42 free descriptors.
-/// We need them since at the same time we can have 16 TCP connections, each takes 
-/// one descriptor, and some OS reserved descriptors etc
-pub const MAX_AVAILABLE_FILE_DESCRIPTORS: usize = 990;
+/// We can have at most 255 open TCP descriptors plus reserved descriptors like STDIN
+/// So 745 is a safe number that leaves a few free, unused descriptors
+pub const MAX_AVAILABLE_FILE_DESCRIPTORS: usize = 745;
 // pub const CHECKSUM_SIZE: usize = 32;
 pub const TMP_PREFIX: &str = "tmp";
 
