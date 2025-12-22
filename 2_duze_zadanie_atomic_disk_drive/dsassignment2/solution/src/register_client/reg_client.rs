@@ -1,10 +1,12 @@
 use tokio::io::AsyncReadExt;
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 use std::{collections::HashMap, path::PathBuf};
 use tokio::time::Instant;
 use tokio::net::{TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc};
 use tokio::time::{sleep, Duration};
+use tokio::sync::{Mutex};
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 
 use crate::SectorIdx;
@@ -14,18 +16,82 @@ use crate::register_client_public::{Broadcast, RegisterClient};
 use crate::register_client_public::Send as RegSend;
 use log::debug;
 
-enum TcpInternalMsg
+#[derive(PartialEq, Clone, Copy)]
+enum TcpSendType
 {
-    SendMsg(RegSend),
-    BroadcastMsg(Broadcast)
+    TcpNormalSend,
+    TcpBroadcast
 }
 
 type TcpTaskTxMap = HashMap<u8, UnboundedSender<Arc<SystemRegisterCommand>>>;
+pub type NewlyCreatedSectorsTxMap = Arc<Mutex<HashMap<
+    SectorIdx, 
+    UnboundedSender<Arc<SystemRegisterCommand>>
+>>>;
+type SectorTxHashMap = Mutex<HashMap<
+    SectorIdx, 
+    UnboundedSender<Arc<SystemRegisterCommand>>
+>>;
 
 pub struct RegClient
 {
+    parent_proc_rank: u8,
     tcp_task_tx_map: TcpTaskTxMap,
-    hmac_system_key: Arc<[u8; 64]>,
+    sector_tx_map: SectorTxHashMap,
+    newly_created_sectors: NewlyCreatedSectorsTxMap,
+}
+
+#[async_trait::async_trait]
+impl RegisterClient for RegClient
+{
+    async fn send(&self, msg: RegSend)
+    {
+        let cmd = msg.cmd;
+        let sector_idx = cmd.header.sector_idx;
+        let target = msg.target;
+
+        if target == self.parent_proc_rank
+        {
+            self.send_msg_to_internal_sector_if_needed(
+                sector_idx, 
+                target, 
+                cmd.clone(), 
+                TcpSendType::TcpNormalSend
+            );
+        }
+        else
+        {
+            if let Some(tcp_tx) = &self.tcp_task_tx_map.get(&target)
+            {
+                tcp_tx.send(cmd.clone());
+            }
+            else
+            {
+                panic!("RegisterClient::send - In proc: '{}', for target proc: '{}', self.tcp_task_tx_map.get(target) returned NONE, this should never happen", self.parent_proc_rank, target);
+            }
+        }
+    }
+
+    async fn broadcast(&self, msg: Broadcast)
+    {
+        let cmd = msg.cmd;
+        let sector_idx = cmd.header.sector_idx;
+        let proc_rank = cmd.header.process_identifier;
+
+        self.send_msg_to_internal_sector_if_needed(
+            sector_idx, 
+            proc_rank, 
+            cmd.clone(), 
+            TcpSendType::TcpBroadcast
+        );
+
+        // there is no tcp task for our proc_id
+        for (_, tcp_task_tx) in &self.tcp_task_tx_map
+        {
+            tcp_task_tx.send(cmd.clone());
+        }
+    }
+
 }
 
 impl RegClient
@@ -34,33 +100,111 @@ impl RegClient
         parent_proc_rank: u8,
         hmac_system_key: &[u8; 64],
         tcp_locations: &Vec<(String, u16)>,
-    ) -> RegClient
+        newly_created_sectors: NewlyCreatedSectorsTxMap,
+    ) -> (RegClient, Vec<JoinHandle<()>>)
     {
-        let hmac_system_key_arc: Arc<[u8; 64]> = Arc::new(*hmac_system_key);
         let mut tcp_task_tx_map: TcpTaskTxMap = HashMap::new();
+        let sector_tx_map: HashMap<
+            SectorIdx, 
+            UnboundedSender<Arc<SystemRegisterCommand>>
+        > = HashMap::new();
 
-        for (proc_rank, (host, port)) in tcp_locations.iter().enumerate()
+        // Do we wait for these tasks even?
+        let task_handles = 
+            for_every_proc_in_system_spawn_tcp_task_that_handles_communication(
+                parent_proc_rank,
+                &mut tcp_task_tx_map,
+                hmac_system_key,
+                &tcp_locations
+        );
+
+        return (
+            RegClient { 
+                parent_proc_rank,
+                tcp_task_tx_map, 
+                sector_tx_map: Mutex::new(sector_tx_map), 
+                newly_created_sectors
+            },
+            task_handles
+        );
+    }
+
+    async fn send_msg_to_internal_sector_if_needed(
+        &self, 
+        sector_idx: SectorIdx,
+        proc_rank: u8,
+        cmd: Arc<SystemRegisterCommand>,
+        send_type: TcpSendType
+    )
+    {
+        // if we have normal send, we need to check if we send for OUR process, if 
+        // not we return
+        if send_type == TcpSendType::TcpNormalSend
         {
-            // We don't want to send msgs to ourselves by TCP
-            if parent_proc_rank != proc_rank as u8
+            if self.parent_proc_rank != proc_rank
             {
-    
-                let (tx, rx) = 
-                    unbounded_channel::<Arc<SystemRegisterCommand>>();
-
-                tcp_task_tx_map.insert(proc_rank as u8, tx);
-    
-                spawn_tcp_task(
-                    proc_rank as u8, 
-                    host.clone(), 
-                    *port, 
-                    rx, 
-                    *hmac_system_key_arc.clone()
-                );
+                return;
             }
         }
-        unimplemented!()
+
+        let mut sector_tx_lock = self.sector_tx_map.lock().await;
+        // When doing broadcast we send msg to our sector skipping TCP part
+        if let Some(sector_tx) = sector_tx_lock.get(&sector_idx)
+        {
+            sector_tx.send(cmd);
+            drop(sector_tx_lock);
+        }
+        else
+        {
+            // We don't have tx for this sector in map thus it must be in 
+            // newly_created_sectors
+            let mut newly_created_sector_lock = self.newly_created_sectors.lock().await;
+
+            if let Some(sector_tx) = newly_created_sector_lock.remove(&sector_idx)
+            {
+                sector_tx.send(cmd);
+                sector_tx_lock.insert(sector_idx, sector_tx);
+                drop(newly_created_sector_lock);
+                drop(sector_tx_lock);
+            }
+            else
+            {
+                panic!("RegisterClient::broadcast - newly_created_sector_lock doesn't have tx for sector {}, this should never happen since we don't have it in our sector_tx_map also", sector_idx);
+            }
+        }
     }
+}
+
+fn for_every_proc_in_system_spawn_tcp_task_that_handles_communication(
+    parent_proc_rank: u8,
+    tcp_task_tx_map: &mut TcpTaskTxMap,
+    hmac_system_key: &[u8; 64],
+    tcp_locations: &[(String, u16)],
+) -> Vec<JoinHandle<()>>
+{
+    let hmac_system_key_arc: Arc<[u8; 64]> = Arc::new(*hmac_system_key);
+    let mut tcp_tasks_handles = vec![];
+
+    for (proc_rank, (host, port)) in tcp_locations.iter().enumerate()
+    {
+        // We don't want to send msgs to ourselves by TCP
+        if parent_proc_rank != proc_rank as u8
+        {
+            let (tx, rx) = 
+                unbounded_channel::<Arc<SystemRegisterCommand>>();
+
+            tcp_task_tx_map.insert(proc_rank as u8, tx);
+
+            tcp_tasks_handles.push(spawn_tcp_task(
+                proc_rank as u8, 
+                host.clone(), 
+                *port, 
+                rx, 
+                *hmac_system_key_arc.clone()
+            ));
+        }
+    }
+    return tcp_tasks_handles;
 }
 
 type OpId = Uuid;
@@ -72,9 +216,9 @@ fn spawn_tcp_task(
     port: u16, 
     mut rx: UnboundedReceiver<Arc<SystemRegisterCommand>>,
     hmac_system_key: [u8; 64],
-)
+) -> JoinHandle<()>
 {
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let addr = format!("{}:{}", host, port);
         let mut send_stream = reconnect(&addr, proc_rank).await;
         let mut sector_sys_msg_map: SectorSysMsgHashMap = HashMap::new();
@@ -122,6 +266,7 @@ fn spawn_tcp_task(
             try_recv_new_msgs(&mut sector_sys_msg_map, &mut rx);
         }
     });
+    return handle;
 }
 
 async fn resend_all_msgs(
