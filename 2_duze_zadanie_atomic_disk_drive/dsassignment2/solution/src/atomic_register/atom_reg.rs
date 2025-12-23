@@ -1,6 +1,7 @@
 use std::collections::{HashSet, HashMap};
 use std::sync::Arc;
 use std::pin::Pin;
+use tokio::sync::mpsc::UnboundedReceiver;
 use uuid::Uuid;
 
 use crate::domain::{
@@ -37,10 +38,7 @@ impl AtomicRegister for AtomReg
     async fn client_command(
         &mut self,
         cmd: ClientRegisterCommand,
-        success_callback: Box<
-            dyn FnOnce(ClientCommandResponse) 
-                -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
-        >,
+        success_callback: SuccessCallbackFunc,
     )
     {
         let header = cmd.header;
@@ -123,6 +121,45 @@ impl AtomicRegister for AtomReg
     }
 }
 
+pub fn spawn_atomic_register_task(
+    self_ident: u8,
+    sector_idx: SectorIdx,
+    register_client: Arc<dyn RegisterClient>,
+    sectors_manager: Arc<dyn SectorsManager>,
+    processes_count: u8,
+    mut sys_cmd_rx: UnboundedReceiver<Arc<SystemRegisterCommand>>,
+    mut client_cmd_rx: UnboundedReceiver<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>,
+)
+{
+    tokio::spawn( async move {
+            let mut atomic_register = AtomReg::new(
+                self_ident, 
+                sector_idx, 
+                register_client, 
+                sectors_manager, 
+                processes_count
+            ).await;
+
+            while let Some(client_msg) = client_cmd_rx.recv().await {
+                let (cmd, success_callback) = client_msg;
+                atomic_register.client_command(*cmd, success_callback).await;
+
+                while let Some(sys_msg) = sys_cmd_rx.recv().await {
+                    atomic_register.system_command((*sys_msg).clone()).await;
+
+                    // If we've ended handling of current sys command we can take
+                    // new one
+                    if atomic_register.handling_of_client_command_ended()
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+    );
+}
+
+
 fn highest(
     readlist: &HashMap<ProcIdx, (TimestampType, WriterRankType, SectorVec)>
 ) -> (TimestampType, WriterRankType, SectorVec)
@@ -182,6 +219,11 @@ impl AtomReg
             client_request_id: None,
             reg_state: RegisterState::new(recovered_ts, recovered_wr, register_val)
         };
+    }
+
+    fn handling_of_client_command_ended(&self) -> bool
+    {
+        return self.success_callback.is_none();
     }
 
     async fn handle_readproc(&mut self, recv_header: &SystemCommandHeader)

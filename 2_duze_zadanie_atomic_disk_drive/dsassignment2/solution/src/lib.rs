@@ -108,17 +108,15 @@ pub mod sectors_manager_public {
 }
 
 pub mod transfer_public {
-    use crate::{ClientCommandHeader, ClientRegisterCommand, 
-        ClientRegisterCommandContent, RegisterCommand, SECTOR_SIZE, SectorVec, SystemCommandHeader, SystemRegisterCommandContent, SystemRegisterCommand,
-        ClientCommandResponse
+    use crate::{ClientCommandHeader, ClientCommandResponse, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand, SECTOR_SIZE, SectorVec, StatusCode, SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent
     };
-    use bincode::{enc, error::{DecodeError, EncodeError}};
+    use bincode::{error::{DecodeError, EncodeError}};
     use sha2::Sha256;
     use std::io::Error;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use hmac::{Hmac, Mac};
     use crate::domain::{CLIENT_READ_CMD_ID, CLIENT_WRITE_CMD_ID, SYS_READ_PROC_CMD_ID, SYS_VALUE_CMD_ID, SYS_WRITE_PROC_CMD_ID, SYS_ACK_CMD_ID,
-    MSG_IDENT_LEN};
+    MSG_IDENT_LEN, ClientResponseOpType};
     use uuid::Uuid;
     use log::{debug};
 
@@ -240,6 +238,43 @@ pub mod transfer_public {
             }
         }
         return Ok(());
+    }
+
+    pub async fn serialize_client_error_response(
+        status: StatusCode,
+        request_identifier: u64,
+        op_type: ClientResponseOpType,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        hmac_key: &[u8],
+    ) -> Result<(), EncodingError> 
+    {
+        if hmac_key.len() != HMAC_CLIENT_KEY_SIZE
+        {
+            return Err(EncodingError::BincodeError(
+                EncodeError::Other(
+                    "During serialization of ClientCommandResponse provided hmac_key has size not equal to expected size: 32"
+            )));
+        }
+        let payload = ClientCommandResponse::encode_without_body(
+            status, 
+            request_identifier, 
+            op_type);
+        let msg_size: u64 = (payload.len() + HMAC_TAG_SIZE) as u64;
+
+        let mut mac = HmacSha256::new_from_slice(hmac_key).unwrap();
+        mac.update(&payload);
+        let hmac_tag = mac.finalize().into_bytes();
+
+        let mut encoded_cmd: Vec<u8> = Vec::new();
+        encoded_cmd.extend_from_slice(&msg_size.to_be_bytes());
+        encoded_cmd.extend_from_slice(&payload);
+        encoded_cmd.extend_from_slice(&hmac_tag);
+
+        match writer.write_all(&encoded_cmd).await
+        {
+            Ok(_) => {return Ok(());},
+            Err(e) => {return Err(EncodingError::IoError(e));}
+        }
     }
 
     pub async fn serialize_client_response(

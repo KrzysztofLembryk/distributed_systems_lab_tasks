@@ -1,26 +1,31 @@
-use bincode::error::AllowedEnumVariants;
+use std::pin::Pin;
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream};
 use tokio::time::{sleep, Duration};
 use std::io::{ErrorKind};
 use std::{collections::HashMap, path::PathBuf};
 use tokio::net::{TcpListener};
 use std::sync::{Arc};
-use tokio::sync::{Mutex};
+use tokio::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 
-use crate::{DecodingError, SECTOR_SIZE, SectorVec};
-use crate::transfer_public::{deserialize_register_command, serialize_client_response};
-use crate::domain::{SectorIdx, Configuration, SystemRegisterCommand, ClientRegisterCommand, RegisterCommand, ClientCommandResponse, StatusCode, OperationReturn, ClientRegisterCommandContent};
+use crate::atomic_register::atom_reg::spawn_atomic_register_task;
+use crate::{DecodingError};
+use crate::transfer_public::{deserialize_register_command, serialize_client_response, serialize_client_error_response};
+use crate::domain::{SectorIdx, Configuration, SystemRegisterCommand, ClientRegisterCommand, RegisterCommand, ClientCommandResponse, StatusCode, OperationReturn, ClientRegisterCommandContent, ClientResponseOpType};
 use crate::sectors_manager_public::{build_sectors_manager, SectorsManager};
 use crate::atomic_register_public::{AtomicRegister, build_atomic_register};
 use crate::register_client::reg_client::{RegClient, NewlyCreatedSectorsTxMap};
 use log::{warn, error};
 
+type SuccessCallbackFunc = Box<
+            dyn FnOnce(ClientCommandResponse) 
+                -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,>;
 type SectorSysClientTxMap = HashMap<
     SectorIdx, 
     (
         UnboundedSender<Arc<SystemRegisterCommand>>,
-        UnboundedSender<Arc<ClientRegisterCommand>>
+        UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>
     )
 >;
 
@@ -36,8 +41,7 @@ struct AtomicDiscDrive
     hmac_system_key: Arc<[u8; 64]>,
     hmac_client_key: Arc<[u8; 32]>,
     tcp_listener: TcpListener,
-    sectors_txs: Arc<Mutex<SectorSysClientTxMap>>,
-    newly_created_sectors: NewlyCreatedSectorsTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     register_client: Arc<RegClient>
 }
 
@@ -75,8 +79,7 @@ impl AtomicDiscDrive
             hmac_system_key: Arc::new(config.hmac_system_key),
             hmac_client_key: Arc::new(config.hmac_client_key),
             tcp_listener,
-            sectors_txs: Arc::new(Mutex::new(HashMap::new())),
-            newly_created_sectors,
+            all_present_sectors: Arc::new(Mutex::new(HashMap::new())),
             register_client: Arc::new(register_client)
         };
     }
@@ -123,18 +126,20 @@ impl AtomicDiscDrive
     }
 }
 
-fn handle_connection(
+fn spawn_task_to_handle_connection(
     mut conn_socket: TcpStream,
     n_sectors: u64,
+    self_rank: u8,
+    n_proc: u8,
     hmac_system_key: Arc<[u8; 64]>,
     hmac_client_key: Arc<[u8; 32]>,
     sectors_manager: Arc<dyn SectorsManager>,
-    sectors_txs: Arc<Mutex<SectorSysClientTxMap>>,
-    newly_created_sectors: NewlyCreatedSectorsTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     register_client: Arc<RegClient>,
 )
 {
     tokio::spawn(async move {
+        let mut sectors_txs: SectorSysClientTxMap = HashMap::new();
         loop 
         {
             match deserialize_register_command(
@@ -146,16 +151,14 @@ fn handle_connection(
                     if !is_hmac_valid 
                     {
                         // System messages should never have invalid HMAC since our 
-                        // implementation takes care of that, however if we get wrong
-                        // hmac from SystemMsg we ignore it
+                        // implementation takes care of that
                         handle_invalid_client_hmac(
                             cmd, 
                             &mut conn_socket, 
                             &hmac_client_key
                         ).await;
-                        // we wait for another msg from client on conn_socket,
-                        // we don't drop connection with him even though he sent 
-                        // msg with wrong hmac
+                        // we encounter invalid msg we end connection
+                        return;
                     }
                     else
                     {
@@ -165,10 +168,12 @@ fn handle_connection(
                                     conn_socket,
                                     c_cmd, 
                                     sectors_manager, 
-                                    sectors_txs, 
-                                    newly_created_sectors, 
+                                    all_present_sectors.clone(),
                                     register_client,
                                     hmac_client_key.clone(),
+                                    self_rank,
+                                    n_sectors,
+                                    n_proc,
                                 ).await;
                                 // If client connects to us, we pass ownership of 
                                 // his socket to AtomicRegister, which will send him
@@ -178,12 +183,22 @@ fn handle_connection(
                             },
                             RegisterCommand::System(s_cmd) => {
                                 // This means that we will be only getting messages 
-                                // from other system processes, so we don't drop this
-                                // connection
-                                handle_sys_cmd(
+                                // from other system processes, we might drop this
+                                // connection when malicious process sends request
+                                // about sector that doesn't exist (idx >= n_sectors)
+                                match handle_sys_cmd(
                                     s_cmd, 
-                                    sectors_txs.clone()
-                                ).await;
+                                    &mut sectors_txs,
+                                    all_present_sectors.clone(),
+                                    n_sectors,
+                                ).await
+                                {
+                                    Ok(_) => {},
+                                    Err(e) => {
+                                        warn!("When handling sys_cmd from other process we got error: '{}', ENDING CONNECTION", e);
+                                        return;
+                                    }
+                                }
                             }
                         }
                     }
@@ -193,12 +208,13 @@ fn handle_connection(
                     match e
                     {
                         DecodingError::IoError(e) => {
-                            error!("We've got IO erorr, ending this connection, err: {:?}", e);
+                            warn!("We've got IO erorr, ending this connection, err: {:?}", e);
                             return;
                         }
-                        _ => {
-                            // Either InvalidMsg or BinCodeError, no need to end c
-                            // connection
+                        other_e => {
+                            // Either InvalidMsg or BinCodeError, 
+                            warn!("Recv Message is invalid, ending this connection, err: {:?}", other_e);
+                            return;
                         }
                     }
                 }
@@ -208,24 +224,156 @@ fn handle_connection(
 }
 
 async fn handle_client_cmd(
-    conn_socket: TcpStream,
+    mut conn_socket: TcpStream,
     c_cmd: ClientRegisterCommand,
     sectors_manager: Arc<dyn SectorsManager>,
-    sectors_txs: Arc<Mutex<SectorSysClientTxMap>>,
-    newly_created_sectors: NewlyCreatedSectorsTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     register_client: Arc<RegClient>,
     hmac_client_key: Arc<[u8; 32]>,
+    self_rank: u8,
+    n_sectors: u64,
+    n_proc: u8,
 )
 {
+    let sector_idx = c_cmd.get_sector_idx();
 
+    if !is_valid_sector(sector_idx, n_sectors)
+    {
+        let status = StatusCode::InvalidSectorIndex;
+        let request_id = c_cmd.header.request_identifier;
+        let op_type: ClientResponseOpType = c_cmd.get_op_type();
+
+        match serialize_client_error_response(
+            status, 
+            request_id, 
+            op_type, 
+            &mut conn_socket, 
+            &(*hmac_client_key)
+        ).await
+        {
+            Ok(_) => {},
+            Err(e) => {warn!("In handle_client_cmd we got error during serialization:{:?}", e);}
+        }
+        // We end connection
+        return;
+    }
+
+    let mut present_sectors_lock = all_present_sectors.lock().await;
+
+    if let Some((_, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+    {
+        send_client_cmd_to_sector_task(
+            conn_socket, 
+            c_cmd, 
+            hmac_client_key.clone(), 
+            &client_cmd_tx
+        );
+    }
+    else
+    {
+        // We insert sector txs to present_sectors_lock when spawning task
+        let client_cmd_tx = spawn_sector_task(
+            &mut present_sectors_lock, 
+            sectors_manager, 
+            register_client, 
+            self_rank, 
+            sector_idx, 
+            n_proc
+        ); 
+
+        // So we can safely drop lock here
+        drop(present_sectors_lock);
+
+        send_client_cmd_to_sector_task(
+            conn_socket, 
+            c_cmd, 
+            hmac_client_key.clone(), 
+            &client_cmd_tx
+        );
+    }
+}
+
+fn spawn_sector_task(
+    present_sectors_lock: &mut MutexGuard<'_, SectorSysClientTxMap>,
+    sectors_manager: Arc<dyn SectorsManager>,
+    register_client: Arc<RegClient>,
+    self_rank: u8,
+    sector_idx: SectorIdx,
+    n_proc: u8,
+) -> UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>
+{
+    let (sys_cmd_tx, sys_cmd_rx) = 
+        unbounded_channel::<Arc<SystemRegisterCommand>>();
+    let (client_cmd_tx, client_cmd_rx) = 
+        unbounded_channel::<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>();
+
+    present_sectors_lock.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
+
+    spawn_atomic_register_task(
+        self_rank, 
+        sector_idx, 
+        register_client, 
+        sectors_manager, 
+        n_proc, 
+        sys_cmd_rx, 
+        client_cmd_rx
+    );
+    return client_cmd_tx;
+}
+
+fn send_client_cmd_to_sector_task(
+    mut conn_socket: TcpStream,
+    c_cmd: ClientRegisterCommand,
+    hmac_client_key: Arc<[u8; 32]>,
+    client_cmd_tx: &UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>,
+)
+{
+    let sector_idx = c_cmd.get_sector_idx();
+
+    let callback_func: SuccessCallbackFunc = Box::new(
+        move |response: ClientCommandResponse| {
+            return Box::pin(async move {
+                let fut = serialize_client_response(
+                    &response, 
+                    &mut conn_socket, 
+                    hmac_client_key.as_ref()
+                );
+                let _ = fut.await;
+            });
+        }
+    );
+
+    // This should never return error since our atomic register once its spawned
+    // will run indefinitely, but if this somehow happens this means that atomic
+    // register is closed so task has ended so we need to respawn it
+    match client_cmd_tx.send((Box::new(c_cmd), callback_func))
+    {
+        Ok(_) => {},
+        Err(e) => {
+            error!("When sending CLient command to sector: '{}', we got error from tx: '{}'. This means our sector task crashed, we need to respawn it", sector_idx, e);
+        }
+    }
 }
 
 async fn handle_sys_cmd(
     s_cmd: SystemRegisterCommand,
-    sectors_txs: Arc<Mutex<SectorSysClientTxMap>>,
-)
+    sectors_txs: &mut SectorSysClientTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
+    n_sectors: u64,
+) -> Result<(), String>
 {
+    if !is_valid_sector(s_cmd.get_sector_idx(), n_sectors)
+    {
+        return Err(format!("When handling connection from other process, we got request for sector: '{}', but there are only '{}' sectors in our system, and their indexes start at 0", s_cmd.get_sector_idx(), n_sectors));
+    }
+    // We might get request for wrong sector from malicious process so we should end
+    // connection with it here
+    unimplemented!()
+}
 
+fn is_valid_sector(cmd_sector: u64, n_sectors: u64) -> bool
+{
+    return cmd_sector < n_sectors;
 }
 
 async fn handle_invalid_client_hmac(
@@ -242,25 +390,12 @@ async fn handle_invalid_client_hmac(
         RegisterCommand::Client(client_cmd) => {
             let request_identifier = client_cmd.header.request_identifier;
 
-            let op_return = match client_cmd.content {
-                ClientRegisterCommandContent::Read => {
-                    OperationReturn::Read {
-                        read_data: SectorVec
-                            ::new_from_slice(&[0; SECTOR_SIZE])
-                    }  
-                },
-                ClientRegisterCommandContent::Write { .. } => {
-                    OperationReturn::Write
-                }
-            };
+            let op_type: ClientResponseOpType = client_cmd.get_op_type();
 
-            let resp_cmd = ClientCommandResponse {
-                status,
+            match serialize_client_error_response(
+                status, 
                 request_identifier,
-                op_return 
-            };
-            match serialize_client_response(
-                &resp_cmd, 
+                op_type,
                 conn_socket, 
                 &*hmac_client_key
             ).await

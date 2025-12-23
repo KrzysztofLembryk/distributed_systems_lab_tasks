@@ -84,12 +84,41 @@ pub struct ClientRegisterCommand {
     pub content: ClientRegisterCommandContent,
 }
 
+impl ClientRegisterCommand 
+{
+    pub fn get_op_type(&self) -> ClientResponseOpType
+    {
+        let op_type: ClientResponseOpType = match self.content {
+            ClientRegisterCommandContent::Read => {
+                ClientResponseOpType::OpRead
+            },
+            ClientRegisterCommandContent::Write { .. } => {
+                ClientResponseOpType::OpWrite
+            }
+        };
+        return op_type;
+    }
+
+    pub fn get_sector_idx(&self) -> u64
+    {
+        return self.header.sector_idx;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Eq, PartialEq)]
 pub struct SystemRegisterCommand {
     /// Identifier of sender process, register (sector) and message
     pub header: SystemCommandHeader,
     /// Content of the system message
     pub content: SystemRegisterCommandContent,
+}
+
+impl SystemRegisterCommand
+{
+    pub fn get_sector_idx(&self) -> u64
+    {
+        return self.header.sector_idx;
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -257,8 +286,37 @@ pub struct ClientCommandResponse {
 const RESPONSE_OP_READ: u8 = 0;
 const RESPONSE_OP_WRITE: u8 = 1;
 
+pub enum ClientResponseOpType
+{
+    OpRead,
+    OpWrite
+}
+
 impl ClientCommandResponse
 {
+
+    pub fn encode_without_body(
+        status: StatusCode, 
+        request_identifier: u64,
+        op_type: ClientResponseOpType,
+    ) -> Vec<u8>
+    {
+        let mut bytes: Vec<u8> = Vec::new();
+        bytes.push(status as u8);
+        bytes.extend_from_slice(&request_identifier.to_be_bytes());
+
+        match op_type
+        {
+            ClientResponseOpType::OpRead => {
+                bytes.push(RESPONSE_OP_READ);
+            },
+            ClientResponseOpType::OpWrite => {
+                bytes.push(RESPONSE_OP_WRITE);
+            }
+        }
+        return bytes;
+    }
+
     pub fn encode(&self) -> Vec<u8>
     {
         let mut bytes: Vec<u8> = Vec::new();
