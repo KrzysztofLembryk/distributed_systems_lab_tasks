@@ -291,7 +291,9 @@ pub mod transfer_public {
         // Uuid is always 16 bytes
         if msg_ident_len != MSG_IDENT_LEN
         {
-            return Err(DecodingError::InvalidMessageSize);
+            return Err(DecodingError::BincodeError(
+                DecodeError::OtherString(format!("When deserializing SystemCmd message identifier len should always be: {}, but is {}", MSG_IDENT_LEN, msg_ident_len))
+            ));
         }
 
         let msg_ident_vec = reader.read_16_bytes().await?;
@@ -466,9 +468,6 @@ pub mod transfer_public {
             debug!("deserialize_client_cmd - reader.size_read ({}) != read_cmd_size ({}", reader.size_read(), read_cmd_size);
             return Err(DecodingError::InvalidMessageSize);
         }
-        // TODO: should we check if reader.read_u8 returns error 
-        // here? This would indicate that there is still some data
-        // so the message is wrong - but this is STREAM so there might be more data
 
         return Ok(
             (
@@ -526,15 +525,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_u8 - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += 1;
             return Ok(buf[0]);
         }
@@ -545,15 +536,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_u32 - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += 4;
             return Ok(u32::from_be_bytes(buf));
         }
@@ -564,15 +547,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_u64 - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += 8;
             return Ok(u64::from_be_bytes(buf));
         }
@@ -584,16 +559,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-
-                        debug!("CmdDeserializer::read_cmd_size_u64 - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             return Ok(u64::from_be_bytes(buf));
         }
 
@@ -603,15 +569,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_32_bytes - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += 32;
             return Ok(buf);
         }
@@ -622,15 +580,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_32_bytes - unexpectedEof");
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += 16;
             return Ok(buf);
         }
@@ -659,15 +609,7 @@ pub mod transfer_public {
             self.reader
                 .read_exact(&mut buf)
                 .await
-                .map_err(|e| match e.kind() {
-                    std::io::ErrorKind::UnexpectedEof => {
-                        debug!("CmdDeserializer::read_n_bytes ({}) - unexpectedEof", len);
-                        DecodingError::InvalidMessageSize
-                    },
-                    _ => {
-                        DecodingError::IoError(e)
-                    }
-                })?;
+                .map_err(|e|  {DecodingError::IoError(e)})?;
             self.size_read += len as u64;
             return Ok(buf);
         }

@@ -125,6 +125,7 @@ impl AtomicDiscDrive
 
 fn handle_connection(
     mut conn_socket: TcpStream,
+    n_sectors: u64,
     hmac_system_key: Arc<[u8; 64]>,
     hmac_client_key: Arc<[u8; 32]>,
     sectors_manager: Arc<dyn SectorsManager>,
@@ -152,7 +153,9 @@ fn handle_connection(
                             &mut conn_socket, 
                             &hmac_client_key
                         ).await;
-                        // we wait for another msg on conn_socket
+                        // we wait for another msg from client on conn_socket,
+                        // we don't drop connection with him even though he sent 
+                        // msg with wrong hmac
                     }
                     else
                     {
