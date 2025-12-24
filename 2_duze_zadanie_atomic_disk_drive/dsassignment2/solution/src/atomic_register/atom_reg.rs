@@ -20,6 +20,7 @@ type ProcIdx = u8;
 type SuccessCallbackFunc = Box<
             dyn FnOnce(ClientCommandResponse) 
                 -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,>;
+type ClientChannelMsg = (Box<ClientRegisterCommand>, SuccessCallbackFunc);
 pub struct AtomReg
 {
     self_ident: u8,
@@ -128,7 +129,7 @@ pub fn spawn_atomic_register_task(
     sectors_manager: Arc<dyn SectorsManager>,
     processes_count: u8,
     mut sys_cmd_rx: UnboundedReceiver<Arc<SystemRegisterCommand>>,
-    mut client_cmd_rx: UnboundedReceiver<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>,
+    mut client_cmd_rx: UnboundedReceiver<ClientChannelMsg>,
 )
 {
     tokio::spawn( async move {
@@ -140,18 +141,28 @@ pub fn spawn_atomic_register_task(
                 processes_count
             ).await;
 
-            while let Some(client_msg) = client_cmd_rx.recv().await {
-                let (cmd, success_callback) = client_msg;
-                atomic_register.client_command(*cmd, success_callback).await;
+            loop
+            {
+                tokio::select! {
+                    // If we get msg from client we switch to handling ONLY system 
+                    // msgs till we send response to client. Since we don't want to
+                    // start next client msg computation before ending prev one
+                    Some(client_msg) = client_cmd_rx.recv() => {
+                        let (cmd, success_callback) = client_msg;
+                        atomic_register.client_command(*cmd, success_callback).await;
 
-                while let Some(sys_msg) = sys_cmd_rx.recv().await {
-                    atomic_register.system_command((*sys_msg).clone()).await;
-
-                    // If we've ended handling of current sys command we can take
-                    // new one
-                    if atomic_register.handling_of_client_command_ended()
-                    {
-                        break;
+                        while let Some(sys_msg) = sys_cmd_rx.recv().await {
+                            atomic_register.system_command((*sys_msg).clone()).await;
+                            // If we've ended handling of current sys command we can 
+                            // take new one
+                            if atomic_register.handling_of_client_command_ended()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Some(sys_msg) = sys_cmd_rx.recv() => {
+                        atomic_register.system_command((*sys_msg).clone()).await;
                     }
                 }
             }

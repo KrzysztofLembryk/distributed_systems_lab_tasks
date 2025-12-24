@@ -167,9 +167,10 @@ fn spawn_task_to_handle_connection(
                                 handle_client_cmd(
                                     conn_socket,
                                     c_cmd, 
-                                    sectors_manager, 
+                                    &mut sectors_txs,
                                     all_present_sectors.clone(),
-                                    register_client,
+                                    sectors_manager.clone(), 
+                                    register_client.clone(),
                                     hmac_client_key.clone(),
                                     self_rank,
                                     n_sectors,
@@ -190,7 +191,11 @@ fn spawn_task_to_handle_connection(
                                     s_cmd, 
                                     &mut sectors_txs,
                                     all_present_sectors.clone(),
+                                    sectors_manager.clone(), 
+                                    register_client.clone(),
+                                    self_rank,
                                     n_sectors,
+                                    n_proc,
                                 ).await
                                 {
                                     Ok(_) => {},
@@ -226,8 +231,9 @@ fn spawn_task_to_handle_connection(
 async fn handle_client_cmd(
     mut conn_socket: TcpStream,
     c_cmd: ClientRegisterCommand,
-    sectors_manager: Arc<dyn SectorsManager>,
+    sectors_txs: &mut SectorSysClientTxMap,
     all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
+    sectors_manager: Arc<dyn SectorsManager>,
     register_client: Arc<RegClient>,
     hmac_client_key: Arc<[u8; 32]>,
     self_rank: u8,
@@ -258,9 +264,9 @@ async fn handle_client_cmd(
         return;
     }
 
-    let mut present_sectors_lock = all_present_sectors.lock().await;
-
-    if let Some((_, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+    // if we have this sector in our sectors_txs map, this means that there is a task
+    // for this sector, so we can safely send msg to it
+    if let Some((_, client_cmd_tx)) = sectors_txs.get(&sector_idx)
     {
         send_client_cmd_to_sector_task(
             conn_socket, 
@@ -269,28 +275,115 @@ async fn handle_client_cmd(
             &client_cmd_tx
         );
     }
-    else
+    else 
     {
-        // We insert sector txs to present_sectors_lock when spawning task
-        let client_cmd_tx = spawn_sector_task(
-            &mut present_sectors_lock, 
-            sectors_manager, 
-            register_client, 
-            self_rank, 
-            sector_idx, 
-            n_proc
-        ); 
+        let mut present_sectors_lock = all_present_sectors.lock().await;
 
-        // So we can safely drop lock here
-        drop(present_sectors_lock);
+        // If we don't have txs for given sector in our map, we check if other tcp
+        // receiver task has spawned it and added it to present_sectors_lock
+        if let Some((sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+        {
+            // If it is in this shared map, we send msg to it and save txs to this 
+            // sector to our internal map
+            send_client_cmd_to_sector_task(
+                conn_socket, 
+                c_cmd, 
+                hmac_client_key.clone(), 
+                &client_cmd_tx
+            );
 
-        send_client_cmd_to_sector_task(
-            conn_socket, 
-            c_cmd, 
-            hmac_client_key.clone(), 
-            &client_cmd_tx
+            sectors_txs.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
+        }
+        else
+        {
+            // If there isnt a task for this sector we spawn it, insert it to shared
+            // map and to our map. Spawn sector function insert txs to shared map
+            let (sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
+                &mut present_sectors_lock, 
+                sectors_manager, 
+                register_client, 
+                self_rank, 
+                sector_idx, 
+                n_proc
+            ); 
+
+            drop(present_sectors_lock);
+
+            send_client_cmd_to_sector_task(
+                conn_socket, 
+                c_cmd, 
+                hmac_client_key.clone(), 
+                &client_cmd_tx
+            );
+
+            sectors_txs.insert(sector_idx, (sys_cmd_tx, client_cmd_tx));
+        }
+    }
+}
+
+async fn handle_sys_cmd(
+    s_cmd: SystemRegisterCommand,
+    sectors_txs: &mut SectorSysClientTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
+    sectors_manager: Arc<dyn SectorsManager>,
+    register_client: Arc<RegClient>,
+    self_rank: u8,
+    n_sectors: u64,
+    n_proc: u8,
+) -> Result<(), String>
+{
+    let sector_idx = s_cmd.get_sector_idx();
+
+    if !is_valid_sector(s_cmd.get_sector_idx(), n_sectors)
+    {
+        return Err(format!("When handling SysCmd from other process, we got request for sector: '{}', but there are only '{}' sectors in our system, and their indexes start at 0", s_cmd.get_sector_idx(), n_sectors));
+    }
+
+    if let Some((sys_cmd_tx, _)) = sectors_txs.get(&sector_idx)
+    {
+        send_sys_cmd_to_sector_task(
+            s_cmd, 
+            &sys_cmd_tx,
+            sector_idx
         );
     }
+    else 
+    {
+        let mut present_sectors_lock = all_present_sectors.lock().await;
+
+        if let Some((sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+        {
+            send_sys_cmd_to_sector_task(
+                s_cmd, 
+                &sys_cmd_tx,
+                sector_idx
+            );
+
+            sectors_txs.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
+        }
+        else
+        {
+            let (sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
+                &mut present_sectors_lock, 
+                sectors_manager, 
+                register_client, 
+                self_rank, 
+                sector_idx, 
+                n_proc
+            ); 
+
+            drop(present_sectors_lock);
+
+            send_sys_cmd_to_sector_task(
+                s_cmd, 
+                &sys_cmd_tx,
+                sector_idx
+            );
+
+            sectors_txs.insert(sector_idx, (sys_cmd_tx, client_cmd_tx));
+        }
+    }
+    return Ok(());
 }
 
 fn spawn_sector_task(
@@ -300,7 +393,10 @@ fn spawn_sector_task(
     self_rank: u8,
     sector_idx: SectorIdx,
     n_proc: u8,
-) -> UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>
+) -> (
+    UnboundedSender<Arc<SystemRegisterCommand>>, 
+    UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>
+)
 {
     let (sys_cmd_tx, sys_cmd_rx) = 
         unbounded_channel::<Arc<SystemRegisterCommand>>();
@@ -318,7 +414,26 @@ fn spawn_sector_task(
         sys_cmd_rx, 
         client_cmd_rx
     );
-    return client_cmd_tx;
+
+    return (sys_cmd_tx, client_cmd_tx);
+}
+
+fn send_sys_cmd_to_sector_task(
+    s_cmd: SystemRegisterCommand,
+    sys_cmd_tx: &UnboundedSender<Arc<SystemRegisterCommand>>,
+    sector_idx: SectorIdx,
+)
+{
+    // This should never return error since our atomic register once its spawned
+    // will run indefinitely, but if this somehow happens this means that atomic
+    // register is closed so task has ended so we need to respawn it
+    match sys_cmd_tx.send(Arc::new(s_cmd))
+    {
+        Ok(_) => {},
+        Err(e) => {
+            error!("When sending CLient command to sector: '{}', we got error from tx: '{}'. This means our sector task crashed, we need to respawn it", sector_idx, e);
+        }
+    }
 }
 
 fn send_client_cmd_to_sector_task(
@@ -355,21 +470,6 @@ fn send_client_cmd_to_sector_task(
     }
 }
 
-async fn handle_sys_cmd(
-    s_cmd: SystemRegisterCommand,
-    sectors_txs: &mut SectorSysClientTxMap,
-    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
-    n_sectors: u64,
-) -> Result<(), String>
-{
-    if !is_valid_sector(s_cmd.get_sector_idx(), n_sectors)
-    {
-        return Err(format!("When handling connection from other process, we got request for sector: '{}', but there are only '{}' sectors in our system, and their indexes start at 0", s_cmd.get_sector_idx(), n_sectors));
-    }
-    // We might get request for wrong sector from malicious process so we should end
-    // connection with it here
-    unimplemented!()
-}
 
 fn is_valid_sector(cmd_sector: u64, n_sectors: u64) -> bool
 {
