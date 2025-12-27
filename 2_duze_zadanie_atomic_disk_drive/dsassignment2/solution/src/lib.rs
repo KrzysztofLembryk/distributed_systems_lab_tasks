@@ -147,15 +147,11 @@ pub mod transfer_public {
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
-        debug!("deserialize_register_command creating new reader");
         let mut reader = CmdDeserializer::new(data);
         // cmd_size is payload + Hmac
 
-        // 
-        debug!("deserialize_register_command reading cmd_size");
         let read_cmd_size = reader.read_cmd_size_u64().await?;
         // Either SystemRegisterCommand or ClientRegisterCommand
-        debug!("deserialize_register_command reading cmd_type");
         let cmd_type = reader.read_u32().await?;
 
         match cmd_type
@@ -191,7 +187,6 @@ pub mod transfer_public {
         hmac_key: &[u8],
     ) -> Result<(), EncodingError> 
     {
-        debug!("serialize_register_command - start");
 
         if hmac_key.len() != HMAC_CLIENT_KEY_SIZE
         && hmac_key.len() != HMAC_SYSTEM_KEY_SIZE
@@ -321,7 +316,6 @@ pub mod transfer_public {
         reader: &'a mut CmdDeserializer<'a>
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
-        debug!("deserialize_system_cmd - start");
         // --------------
         // READING HEADER
         // --------------
@@ -370,11 +364,9 @@ pub mod transfer_public {
         match system_op_cmd
         {
             SYS_READ_PROC_CMD_ID => {
-                debug!("deserialize_system_cmd - command:  READ");
                 content = SystemRegisterCommandContent::ReadProc;
             },
             SYS_VALUE_CMD_ID => {
-                debug!("deserialize_system_cmd - command:  VALUE");
                 let t_stamp: u64 = reader.read_u64().await?;
                 let write_rank: u8 = reader.read_u8().await?;
                 let sector_data: SectorVec = reader.read_sector_data().await?;
@@ -390,7 +382,6 @@ pub mod transfer_public {
                 };
             },
             SYS_WRITE_PROC_CMD_ID => {
-                debug!("deserialize_system_cmd - command: WRITE");
                 let t_stamp: u64 = reader.read_u64().await?;
                 let write_rank: u8 = reader.read_u8().await?;
                 let data_to_write: SectorVec = reader.read_sector_data().await?;
@@ -406,7 +397,6 @@ pub mod transfer_public {
                 };
             },
             SYS_ACK_CMD_ID => {
-                debug!("deserialize_system_cmd - command: ACK");
                 content = SystemRegisterCommandContent::Ack;
             },
             _ => {
@@ -426,7 +416,6 @@ pub mod transfer_public {
         // reader but we don't care)
         if reader.size_read() != read_cmd_size
         {
-            debug!("deserialize_system_cmd - reader.size_read ({}) != read_cmd_size ({})", reader.size_read(), read_cmd_size);
             return Err(DecodingError::InvalidMessageSize);
         }
 
@@ -472,11 +461,9 @@ pub mod transfer_public {
         match client_op_cmd
         {
             CLIENT_READ_CMD_ID => {
-                debug!("deserialize_client_cmd - command: READ");
                 content = ClientRegisterCommandContent::Read;
             },
             CLIENT_WRITE_CMD_ID => {
-                debug!("deserialize_client_cmd - command: WRITE");
                 // If there is to little data, reader returns error
                 let sector_data = reader.read_sector_data().await?;
             
@@ -505,7 +492,6 @@ pub mod transfer_public {
         // reader but we don't care)
         if reader.size_read() != read_cmd_size
         {
-            debug!("deserialize_client_cmd - reader.size_read ({}) != read_cmd_size ({}", reader.size_read(), read_cmd_size);
             return Err(DecodingError::InvalidMessageSize);
         }
 
@@ -555,7 +541,6 @@ pub mod transfer_public {
     {
         fn new(data: &'a mut (dyn AsyncRead + Send + Unpin)) -> Self 
         {
-            debug!("CmdDeserializer::new()");
             CmdDeserializer {reader: data, size_read: 0}
         }
 

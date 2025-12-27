@@ -189,7 +189,6 @@ impl SystemRegisterCommandContent
 
     pub fn encode(&self) -> Vec<u8>
     {
-        debug!("SystemRegisterCommandContent::encode");
         let mut bytes: Vec<u8> = Vec::new();
         match self
         {
@@ -254,7 +253,6 @@ impl ClientRegisterCommandContent
     }
     pub fn encode(&self) -> Vec<u8>
     {
-        debug!("ClientRegisterCommandContent::encode");
         let mut bytes: Vec<u8> = Vec::new();
         match self
         {
@@ -287,7 +285,6 @@ impl ClientCommandHeader
     }
     pub fn encode(&self) -> Vec<u8>
     {
-        debug!("ClientCommandHeader::encode");
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(&self.request_identifier.to_be_bytes());
         bytes.extend_from_slice(&self.sector_idx.to_be_bytes());
@@ -317,7 +314,6 @@ impl SystemCommandHeader
     }
     pub fn encode(&self) -> Vec<u8>
     {
-        debug!("SystemCommandHeader::encode");
         let mut bytes: Vec<u8> = Vec::new();
         bytes.extend_from_slice(&self.process_identifier.to_be_bytes());
         bytes.extend_from_slice(&MSG_IDENT_LEN.to_be_bytes());

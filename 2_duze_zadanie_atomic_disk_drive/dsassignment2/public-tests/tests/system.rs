@@ -87,11 +87,12 @@ async fn single_process_system_completes_operation_write() {
 
 #[tokio::test]
 #[timeout(4000)]
-async fn single_process_system_completes_operation_write_read() {
+async fn single_process_system_completes_operation_write_read() 
+{
     // given
     init_logger();
     let hmac_client_key = [5; 32];
-    let tcp_port = 30_287;
+    let tcp_port = 30_288;
     let storage_dir = tempdir().unwrap();
     let request_identifier = 1778;
 
@@ -113,7 +114,6 @@ async fn single_process_system_completes_operation_write_read() {
         .await
         .expect("Could not connect to TCP port");
 
-    debug!("TEST - success tcp connection");
     // --- WRITE ---
     let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
         header: ClientCommandHeader {
@@ -125,7 +125,6 @@ async fn single_process_system_completes_operation_write_read() {
         },
     });
 
-    debug!("TEST - sending write");
     send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
 
     let mut expected = PacketBuilder::new();
@@ -142,13 +141,11 @@ async fn single_process_system_completes_operation_write_read() {
         .read_exact(&mut buf)
         .await
         .expect("Less data then expected");
-    debug!("TEST - read data from stream");
     // asserts for write response
     let cmp_bytes = expected_len - HMAC_TAG_SIZE;
     assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
     assert!(hmac_tag_is_ok(&hmac_client_key, &buf[8..]));
 
-    debug!("TEST - WRITE PASSED");
     // --- READ ---
     let read_cmd = RegisterCommand::Client(ClientRegisterCommand {
         header: ClientCommandHeader {
@@ -158,9 +155,7 @@ async fn single_process_system_completes_operation_write_read() {
         content: ClientRegisterCommandContent::Read,
     });
 
-    debug!("TEST - SENDING READ");
     send_cmd(&read_cmd, &mut stream, &hmac_client_key).await;
-    debug!("TEST - READ CMD SEND PASSED");
 
     let mut expected_read = PacketBuilder::new();
     expected_read.add_u64(0); // size placeholder
@@ -174,12 +169,10 @@ async fn single_process_system_completes_operation_write_read() {
 
     let mut buf_read = vec![0u8; expected_read_len];
 
-    debug!("TEST - BEFORE READ_EXACT");
     stream
         .read_exact(&mut buf_read)
         .await
         .expect("Less data then expected");
-    debug!("TEST - AFTER READ_EXACT");
 
     // asserts for read response
     let cmp_bytes_read = expected_read_len - HMAC_TAG_SIZE;
@@ -256,7 +249,7 @@ async fn concurrent_operations_on_the_same_sector()
 {
     init_logger();
     // given
-    let port_range_start = 21518;
+    let port_range_start = 21519;
     let n_clients = 16;
     let config = TestProcessesConfig::new(1, port_range_start);
     config.start().await;

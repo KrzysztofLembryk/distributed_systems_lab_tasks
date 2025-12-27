@@ -14,7 +14,7 @@ use crate::transfer_public::{serialize_register_command};
 use crate::domain::{SystemRegisterCommand, RegisterCommand};
 use crate::register_client_public::{Broadcast, RegisterClient};
 use crate::register_client_public::Send as RegSend;
-use log::debug;
+use log::{debug, warn};
 
 #[derive(PartialEq, Clone, Copy)]
 enum TcpSendType
@@ -179,14 +179,16 @@ fn for_every_proc_in_system_spawn_tcp_task_that_handles_communication(
 
     for (proc_rank, (host, port)) in tcp_locations.iter().enumerate()
     {
+        // proc ranks are from 1 to tcp_locations.len, so we need to add 1 to 
+        // proc_rank since it starts from 0
+        let proc_rank = proc_rank + 1;
         // We don't want to send msgs to ourselves by TCP
-        if (parent_proc_rank - 1) != proc_rank as u8
+        if parent_proc_rank != proc_rank as u8
         {
-            debug!("Spawnig tcp task for proc {} ", proc_rank);
             let (tx, rx) = 
                 unbounded_channel::<Arc<SystemRegisterCommand>>();
 
-            tcp_task_tx_map.insert(proc_rank as u8, tx);
+            tcp_task_tx_map.insert((proc_rank) as u8, tx);
 
             tcp_tasks_handles.push(spawn_tcp_task(
                 proc_rank as u8, 
@@ -281,7 +283,7 @@ async fn resend_all_msgs(
         {
             Ok(_) => {},
             Err(e) => {
-                debug!("While sending msg to proc: {} about sector: {}, send_stream returned error: '{:?}'\nTrying to reconnect.", proc_rank, sector_idx, e);
+                warn!("While sending msg to proc: {} about sector: {}, send_stream returned error: '{:?}'\nTrying to reconnect.", proc_rank, sector_idx, e);
                 *send_stream = reconnect(&addr, proc_rank).await;
                 continue;
             }
@@ -359,7 +361,7 @@ async fn reconnect(addr: &str, proc_rank: u8) -> TcpStream
         match TcpStream::connect(&addr).await {
             Ok(s) => {return s;},
             Err(e) => {
-                debug!("Couldnt connect to process: {} with address: {}\nError: '{}'\nAfter timeout (300) will retry", proc_rank, addr, e);
+                warn!("Couldnt connect to process: {} with address: {}\nError: '{}'\nAfter timeout (300) will retry", proc_rank, addr, e);
                 sleep(Duration::from_millis(300)).await;
             }
         };
