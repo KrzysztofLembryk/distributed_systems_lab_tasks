@@ -1,14 +1,14 @@
-use tokio::io::AsyncReadExt;
 use tokio::task::JoinHandle;
 use uuid::Uuid;
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap};
 use tokio::time::Instant;
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpStream};
 use std::sync::{Arc};
 use tokio::time::{sleep, Duration};
 use tokio::sync::{Mutex};
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 
+use crate::atomic_disc_drive::atomic_disc_drive::{SectorSysClientTxMap};
 use crate::SectorIdx;
 use crate::transfer_public::{serialize_register_command};
 use crate::domain::{SystemRegisterCommand, RegisterCommand};
@@ -24,10 +24,6 @@ enum TcpSendType
 }
 
 type TcpTaskTxMap = HashMap<u8, UnboundedSender<Arc<SystemRegisterCommand>>>;
-pub type NewlyCreatedSectorsTxMap = Arc<Mutex<HashMap<
-    SectorIdx, 
-    UnboundedSender<Arc<SystemRegisterCommand>>
->>>;
 type SectorTxHashMap = Mutex<HashMap<
     SectorIdx, 
     UnboundedSender<Arc<SystemRegisterCommand>>
@@ -38,7 +34,7 @@ pub struct RegClient
     parent_proc_rank: u8,
     tcp_task_tx_map: TcpTaskTxMap,
     sector_tx_map: SectorTxHashMap,
-    newly_created_sectors: NewlyCreatedSectorsTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
 }
 
 #[async_trait::async_trait]
@@ -83,15 +79,14 @@ impl RegisterClient for RegClient
             proc_rank, 
             cmd.clone(), 
             TcpSendType::TcpBroadcast
-        );
+        ).await;
 
         // there is no tcp task for our proc_id
-        for (_, tcp_task_tx) in &self.tcp_task_tx_map
+        for (_proc_idx, tcp_task_tx) in &self.tcp_task_tx_map
         {
-            tcp_task_tx.send(cmd.clone());
+            tcp_task_tx.send(cmd.clone()).expect("RegClient::broadcast:: tcp_task_tx.send(cmd.clone()), returned error");
         }
     }
-
 }
 
 impl RegClient
@@ -100,14 +95,10 @@ impl RegClient
         parent_proc_rank: u8,
         hmac_system_key: &[u8; 64],
         tcp_locations: &Vec<(String, u16)>,
-        newly_created_sectors: NewlyCreatedSectorsTxMap,
+        all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     ) -> (RegClient, Vec<JoinHandle<()>>)
     {
         let mut tcp_task_tx_map: TcpTaskTxMap = HashMap::new();
-        let sector_tx_map: HashMap<
-            SectorIdx, 
-            UnboundedSender<Arc<SystemRegisterCommand>>
-        > = HashMap::new();
 
         // Do we wait for these tasks even?
         let task_handles = 
@@ -122,8 +113,8 @@ impl RegClient
             RegClient { 
                 parent_proc_rank,
                 tcp_task_tx_map, 
-                sector_tx_map: Mutex::new(sector_tx_map), 
-                newly_created_sectors
+                sector_tx_map: Mutex::new(HashMap::new()), 
+                all_present_sectors 
             },
             task_handles
         );
@@ -158,18 +149,18 @@ impl RegClient
         {
             // We don't have tx for this sector in map thus it must be in 
             // newly_created_sectors
-            let mut newly_created_sector_lock = self.newly_created_sectors.lock().await;
+            let all_present_sectors_lock = self.all_present_sectors.lock().await;
 
-            if let Some(sector_tx) = newly_created_sector_lock.remove(&sector_idx)
+            if let Some((sys_sector_tx, _)) = all_present_sectors_lock.get(&sector_idx)
             {
-                sector_tx.send(cmd).unwrap();
-                sector_tx_lock.insert(sector_idx, sector_tx);
-                drop(newly_created_sector_lock);
+                sys_sector_tx.send(cmd).unwrap();
+                sector_tx_lock.insert(sector_idx, sys_sector_tx.clone());
+                drop(all_present_sectors_lock);
                 drop(sector_tx_lock);
             }
             else
             {
-                panic!("RegisterClient::broadcast - newly_created_sector_lock doesn't have tx for sector {}, this should never happen since we don't have it in our sector_tx_map also", sector_idx);
+                panic!("RegisterClient::send_msg_to_internal_sector_if_needed - all_present_sectors doesn't have tx for sector {}, this should never happen since we don't have it in our sector_tx_map also", sector_idx);
             }
         }
     }
@@ -184,12 +175,14 @@ fn for_every_proc_in_system_spawn_tcp_task_that_handles_communication(
 {
     let hmac_system_key_arc: Arc<[u8; 64]> = Arc::new(*hmac_system_key);
     let mut tcp_tasks_handles = vec![];
+    debug!("There are '{}' processes in system, spawning tasks for them", tcp_locations.len());
 
     for (proc_rank, (host, port)) in tcp_locations.iter().enumerate()
     {
         // We don't want to send msgs to ourselves by TCP
-        if parent_proc_rank != proc_rank as u8
+        if (parent_proc_rank - 1) != proc_rank as u8
         {
+            debug!("Spawnig tcp task for proc {} ", proc_rank);
             let (tx, rx) = 
                 unbounded_channel::<Arc<SystemRegisterCommand>>();
 

@@ -1,5 +1,4 @@
 use std::pin::Pin;
-use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpStream};
 use tokio::time::{sleep, Duration};
 use std::io::{ErrorKind};
@@ -7,21 +6,20 @@ use std::{collections::HashMap, path::PathBuf};
 use tokio::net::{TcpListener};
 use std::sync::{Arc};
 use tokio::sync::{Mutex, MutexGuard};
-use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
+use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::atomic_register::atom_reg::spawn_atomic_register_task;
 use crate::{DecodingError};
 use crate::transfer_public::{deserialize_register_command, serialize_client_response, serialize_client_error_response};
-use crate::domain::{SectorIdx, Configuration, SystemRegisterCommand, ClientRegisterCommand, RegisterCommand, ClientCommandResponse, StatusCode, OperationReturn, ClientRegisterCommandContent, ClientResponseOpType};
+use crate::domain::{SectorIdx, Configuration, SystemRegisterCommand, ClientRegisterCommand, RegisterCommand, ClientCommandResponse, StatusCode, ClientResponseOpType};
 use crate::sectors_manager_public::{build_sectors_manager, SectorsManager};
-use crate::atomic_register_public::{AtomicRegister, build_atomic_register};
-use crate::register_client::reg_client::{RegClient, NewlyCreatedSectorsTxMap};
-use log::{warn, error};
+use crate::register_client::reg_client::{RegClient};
+use log::{warn, error, debug};
 
-type SuccessCallbackFunc = Box<
+pub type SuccessCallbackFunc = Box<
             dyn FnOnce(ClientCommandResponse) 
                 -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,>;
-type SectorSysClientTxMap = HashMap<
+pub type SectorSysClientTxMap = HashMap<
     SectorIdx, 
     (
         UnboundedSender<Arc<SystemRegisterCommand>>,
@@ -32,7 +30,7 @@ type SectorSysClientTxMap = HashMap<
 // Too many file descriptors opened os error
 const EMFILE: i32 = 24;
 
-struct AtomicDiscDrive
+pub struct AtomicDiscDrive
 {
     storage_dir: PathBuf,
     self_rank: u8,
@@ -61,14 +59,14 @@ impl AtomicDiscDrive
         let tcp_listener = bind_socket_for_listening(self_rank - 1, &tcp_locations)
                     .await
                     .unwrap();
-        let newly_created_sectors: NewlyCreatedSectorsTxMap = 
+        let all_present_sectors: Arc<Mutex<SectorSysClientTxMap>> = 
             Arc::new(Mutex::new(HashMap::new()));
 
-        let (register_client, reg_client_task_handles) = RegClient::new(
+        let (register_client, _reg_client_task_handles) = RegClient::new(
             self_rank, 
             &config.hmac_system_key, 
             &tcp_locations, 
-            newly_created_sectors.clone()
+            all_present_sectors.clone()
         );
 
         return AtomicDiscDrive {
@@ -79,7 +77,7 @@ impl AtomicDiscDrive
             hmac_system_key: Arc::new(config.hmac_system_key),
             hmac_client_key: Arc::new(config.hmac_client_key),
             tcp_listener,
-            all_present_sectors: Arc::new(Mutex::new(HashMap::new())),
+            all_present_sectors: all_present_sectors,
             register_client: Arc::new(register_client)
         };
     }
@@ -92,8 +90,18 @@ impl AtomicDiscDrive
         loop {
             match self.tcp_listener.accept().await
             {
-                Ok((mut conn_socket, _response_addr)) => {
-
+                Ok((conn_socket, _response_addr)) => {
+                    debug!("Getting connection from: {}", _response_addr);
+                    spawn_task_to_handle_connection(
+                        conn_socket, 
+                        self.n_sectors, 
+                        self.self_rank, 
+                        self.n_proc, 
+                        self.hmac_system_key.clone(), 
+                        self.hmac_client_key.clone(), 
+                        sectors_manager.clone(), 
+                        self.all_present_sectors.clone(), 
+                        self.register_client.clone());
                 },
                 Err(e) => {
                     match e.kind()
@@ -152,7 +160,7 @@ fn spawn_task_to_handle_connection(
                     {
                         // System messages should never have invalid HMAC since our 
                         // implementation takes care of that
-                        handle_invalid_client_hmac(
+                        handle_invalid_hmac(
                             cmd, 
                             &mut conn_socket, 
                             &hmac_client_key
@@ -164,10 +172,10 @@ fn spawn_task_to_handle_connection(
                     {
                         match cmd {
                             RegisterCommand::Client(c_cmd) => {
+                                debug!("Got client command");
                                 handle_client_cmd(
                                     conn_socket,
                                     c_cmd, 
-                                    &mut sectors_txs,
                                     all_present_sectors.clone(),
                                     sectors_manager.clone(), 
                                     register_client.clone(),
@@ -231,7 +239,6 @@ fn spawn_task_to_handle_connection(
 async fn handle_client_cmd(
     mut conn_socket: TcpStream,
     c_cmd: ClientRegisterCommand,
-    sectors_txs: &mut SectorSysClientTxMap,
     all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     sectors_manager: Arc<dyn SectorsManager>,
     register_client: Arc<RegClient>,
@@ -266,8 +273,16 @@ async fn handle_client_cmd(
 
     // if we have this sector in our sectors_txs map, this means that there is a task
     // for this sector, so we can safely send msg to it
-    if let Some((_, client_cmd_tx)) = sectors_txs.get(&sector_idx)
+    let mut present_sectors_lock = all_present_sectors.lock().await;
+
+    // If we don't have txs for given sector in our map, we check if other tcp
+    // receiver task has spawned it and added it to present_sectors_lock
+    if let Some((_sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
     {
+        // If it is in this shared map, we send msg to it and save txs to this 
+        // sector to our internal map
+
+        debug!("Sending client cmd to sector task");
         send_client_cmd_to_sector_task(
             conn_socket, 
             c_cmd, 
@@ -275,49 +290,28 @@ async fn handle_client_cmd(
             &client_cmd_tx
         );
     }
-    else 
+    else
     {
-        let mut present_sectors_lock = all_present_sectors.lock().await;
+        debug!("handle_client_cmd: no task for sector: {} yet, will create it", sector_idx);
+        // If there isnt a task for this sector we spawn it, insert it to shared
+        // map. Spawn sector function insert txs to shared map
+        let (_sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
+            &mut present_sectors_lock, 
+            sectors_manager, 
+            register_client, 
+            self_rank, 
+            sector_idx, 
+            n_proc
+        ); 
 
-        // If we don't have txs for given sector in our map, we check if other tcp
-        // receiver task has spawned it and added it to present_sectors_lock
-        if let Some((sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
-        {
-            // If it is in this shared map, we send msg to it and save txs to this 
-            // sector to our internal map
-            send_client_cmd_to_sector_task(
-                conn_socket, 
-                c_cmd, 
-                hmac_client_key.clone(), 
-                &client_cmd_tx
-            );
+        drop(present_sectors_lock);
 
-            sectors_txs.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
-        }
-        else
-        {
-            // If there isnt a task for this sector we spawn it, insert it to shared
-            // map and to our map. Spawn sector function insert txs to shared map
-            let (sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
-                &mut present_sectors_lock, 
-                sectors_manager, 
-                register_client, 
-                self_rank, 
-                sector_idx, 
-                n_proc
-            ); 
-
-            drop(present_sectors_lock);
-
-            send_client_cmd_to_sector_task(
-                conn_socket, 
-                c_cmd, 
-                hmac_client_key.clone(), 
-                &client_cmd_tx
-            );
-
-            sectors_txs.insert(sector_idx, (sys_cmd_tx, client_cmd_tx));
-        }
+        send_client_cmd_to_sector_task(
+            conn_socket, 
+            c_cmd, 
+            hmac_client_key.clone(), 
+            &client_cmd_tx
+        );
     }
 }
 
@@ -448,16 +442,20 @@ fn send_client_cmd_to_sector_task(
     let callback_func: SuccessCallbackFunc = Box::new(
         move |response: ClientCommandResponse| {
             return Box::pin(async move {
+                debug!("SuccessCallback - serialize client response: {:?}", response);
                 let fut = serialize_client_response(
                     &response, 
                     &mut conn_socket, 
                     hmac_client_key.as_ref()
                 );
                 let _ = fut.await;
+
+                debug!("SuccessCallback - conn_socket should be dropped here");
             });
         }
     );
 
+    debug!("AtomicDiscDrive::send_clinet_cmd_to_sector_task: Sending ClinetCMd to sector");
     // This should never return error since our atomic register once its spawned
     // will run indefinitely, but if this somehow happens this means that atomic
     // register is closed so task has ended so we need to respawn it
@@ -476,7 +474,7 @@ fn is_valid_sector(cmd_sector: u64, n_sectors: u64) -> bool
     return cmd_sector < n_sectors;
 }
 
-async fn handle_invalid_client_hmac(
+async fn handle_invalid_hmac(
     cmd: RegisterCommand,
     conn_socket: &mut TcpStream,
     hmac_client_key: &[u8; 32],

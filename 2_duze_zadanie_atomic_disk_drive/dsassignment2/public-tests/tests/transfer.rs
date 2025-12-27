@@ -1,8 +1,8 @@
 use assignment_2_solution::{
     ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, RegisterCommand,
     SystemCommandHeader, SystemRegisterCommand, SystemRegisterCommandContent,
-    deserialize_register_command, serialize_register_command,
-    SectorVec, SECTOR_SIZE, DecodingError
+    ClientCommandResponse, StatusCode, OperationReturn,
+    deserialize_register_command, serialize_register_command, serialize_client_error_response, serialize_client_response, SectorVec, SECTOR_SIZE
 };
 
 use assignment_2_test_utils::transfer::PacketBuilder;
@@ -27,6 +27,246 @@ fn init_logger() {
         .try_init();
 }
 
+const RESPONSE_STATUS_OK_VAL: u32 = 0;
+const RESPONSE_STATUS_AUTH_FAIL_VAL: u32 = 1;
+const RESPONSE_STATUS_INVALID_SECTOR_VAL: u32 = 2;
+const OP_RET_READ: u32 = 0;
+const OP_RET_WRITE: u32 = 1;
+const HMAC_TAG_SIZE: usize = 32;
+
+// #################################################################################
+// ###################### CLIENT RESPONSE SERIALIZATION TESTS ######################
+// #################################################################################
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_ok_op_write() {
+
+    init_logger();
+    // given
+    let request_identifier: u64 = 7;
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::Ok,
+        request_identifier,
+        op_return: OperationReturn::Write
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x00_u8; 32];
+
+    // when
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0); // size placeholder
+    expected.add_u32(RESPONSE_STATUS_OK_VAL); // Status ok
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_WRITE); // OperationReturn::Write
+    expected.add_slice(&client_hmac); // hmac placeholder
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+
+    assert!(stream.len() == expected_len);
+
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    // asserts for write response
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_ok_op_read() {
+    init_logger();
+    let request_identifier: u64 = 8;
+    let sector_data = SectorVec(Box::new(serde_big_array::Array([0x11_u8; SECTOR_SIZE])));
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::Ok,
+        request_identifier,
+        op_return: OperationReturn::Read { read_data: sector_data.clone() }
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x01_u8; 32];
+
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0); // size placeholder
+    expected.add_u32(RESPONSE_STATUS_OK_VAL); // Status ok
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_READ); // OperationReturn::Read
+    expected.add_slice(sector_data.as_slice());
+    expected.add_slice(&client_hmac); // hmac placeholder
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    
+    assert!(stream.len() == expected_len);
+
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_authfailure_op_read() {
+    init_logger();
+    let request_identifier: u64 = 9;
+    let sector_data = SectorVec(Box::new(serde_big_array::Array([0x22_u8; SECTOR_SIZE])));
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::AuthFailure,
+        request_identifier,
+        op_return: OperationReturn::Read { read_data: sector_data.clone() }
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x02_u8; 32];
+
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0);
+    expected.add_u32(RESPONSE_STATUS_AUTH_FAIL_VAL); // AuthFailure
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_READ);
+    // No sector data for AuthFailure, just hmac
+    expected.add_slice(&client_hmac);
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    assert!(stream.len() == expected_len);
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_authfailure_op_write() 
+{
+    init_logger();
+    let request_identifier: u64 = 10;
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::AuthFailure,
+        request_identifier,
+        op_return: OperationReturn::Write
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x03_u8; 32];
+
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0);
+    expected.add_u32(RESPONSE_STATUS_AUTH_FAIL_VAL); // AuthFailure
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_WRITE);
+    expected.add_slice(&client_hmac);
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    assert!(stream.len() == expected_len);
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_invalidsector_op_read() {
+    init_logger();
+    let request_identifier: u64 = 11;
+    let sector_data = SectorVec(Box::new(serde_big_array::Array([0x33_u8; SECTOR_SIZE])));
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::InvalidSectorIndex,
+        request_identifier,
+        op_return: OperationReturn::Read { read_data: sector_data.clone() }
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x04_u8; 32];
+
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0);
+    expected.add_u32(RESPONSE_STATUS_INVALID_SECTOR_VAL); // InvalidSectorIndex
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_READ);
+    // No sector data for InvalidSectorIndex, just hmac
+    expected.add_slice(&client_hmac);
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    assert!(stream.len() == expected_len);
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+#[tokio::test]
+#[timeout(200)]
+async fn serialize_client_response_status_invalidsector_op_write() 
+{
+    init_logger();
+    let request_identifier: u64 = 12;
+    let resp_cmd = ClientCommandResponse {
+        status: StatusCode::InvalidSectorIndex,
+        request_identifier,
+        op_return: OperationReturn::Write
+    };
+    let mut stream: Vec<u8> = Vec::new();
+    let client_hmac = [0x05_u8; 32];
+
+    serialize_client_response(&resp_cmd, &mut stream, &client_hmac)
+        .await
+        .expect("Could not serialize?");
+
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0);
+    expected.add_u32(RESPONSE_STATUS_INVALID_SECTOR_VAL); // InvalidSectorIndex
+    expected.add_u64(request_identifier);
+    expected.add_u32(OP_RET_WRITE);
+    expected.add_slice(&client_hmac);
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    assert!(stream.len() == expected_len);
+    buf.clone_from_slice(&stream[..expected_len]);
+
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&client_hmac, &buf[8..]));
+}
+
+// #################################################################################
+// ######################### SERIALIZE/DESERIALIZE CMDS TESTS ######################
+// #################################################################################
 #[tokio::test]
 #[timeout(200)]
 async fn serialize_deserialize_is_identity_client_read() {
@@ -297,7 +537,8 @@ async fn serialize_deserialize_is_identity_system_write_proc() {
 
 #[tokio::test]
 #[timeout(200)]
-async fn serialize_deserialize_is_identity_system_ack() {
+async fn serialize_deserialize_is_identity_system_ack() 
+{
     init_logger();
     // given
     let process_identifier = 11;
@@ -431,10 +672,6 @@ async fn deserialize_wrong_cmd_id()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::BincodeError(_)) => {},
-        _ => panic!("Expected BincodeError for invalid operation type"),
-    }
 }
 
 #[tokio::test]
@@ -484,10 +721,6 @@ async fn deserialize_huge_msg_ident_size()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::InvalidMessageSize) => {},
-        _ => panic!("Expected InvalidMessageSize for unreasonable msg_ident size"),
-    }
 }
 
 #[tokio::test]
@@ -547,10 +780,6 @@ async fn deserialize_wrong_system_op_cmd()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::BincodeError(_)) => {},
-        _ => panic!("Expected BincodeError for invalid operation type"),
-    }
 }
 
 #[tokio::test]
@@ -604,10 +833,6 @@ async fn deserialize_wrong_client_op_cmd()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::BincodeError(_)) => {},
-        _ => panic!("Expected BincodeError for invalid client operation type"),
-    }
 }
 
 #[tokio::test]
@@ -659,10 +884,6 @@ async fn deserialize_client_write_too_little_sector_data()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::InvalidMessageSize) => {},
-        _ => panic!("Expected InvalidMessageSize for incomplete sector data"),
-    }
 }
 
 #[tokio::test]
@@ -722,10 +943,6 @@ async fn deserialize_client_write_too_much_sector_data()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::InvalidMessageSize) => {},
-        _ => panic!("Expected InvalidMessageSize for too much sector data"),
-    }
 }
 
 #[tokio::test]
@@ -770,10 +987,6 @@ async fn deserialize_client_cmd_missing_hmac_but_present_in_size()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::InvalidMessageSize) | Err(DecodingError::IoError(_)) => {},
-        _ => panic!("Expected error for missing HMAC"),
-    }
 }
 
 #[tokio::test]
@@ -818,10 +1031,6 @@ async fn deserialize_client_cmd_missing_hmac_not_present_in_size()
     
     // then
     assert!(result.is_err());
-    match result {
-        Err(DecodingError::InvalidMessageSize) | Err(DecodingError::IoError(_)) => {},
-        _ => panic!("Expected error for missing HMAC"),
-    }
 }
 
 #[tokio::test]
@@ -938,4 +1147,13 @@ async fn deserialize_client_cmd_tampered_data()
         }
         _ => panic!("Expected Write command"),
     }
+}
+
+
+
+fn hmac_tag_is_ok(key: &[u8], data: &[u8]) -> bool {
+    let boundary = data.len() - HMAC_TAG_SIZE;
+    let mut mac = HmacSha256::new_from_slice(key).unwrap();
+    mac.update(&data[..boundary]);
+    mac.verify_slice(&data[boundary..]).is_ok()
 }

@@ -9,12 +9,12 @@ pub use atomic_register_public::*;
 pub use register_client_public::*;
 pub use sectors_manager_public::*;
 pub use transfer_public::*;
+use crate::atomic_disc_drive::atomic_disc_drive::AtomicDiscDrive;
 
 pub async fn run_register_process(config: Configuration) {
-    let system_hmac_key = config.hmac_system_key;
-    let client_hamc_key = config.hmac_client_key;
-    let public_config = config.public;
-    unimplemented!()
+    let mut register_proc = AtomicDiscDrive::new(config).await;
+
+    register_proc.run().await;
 }
 
 pub mod atomic_register_public {

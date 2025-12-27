@@ -283,8 +283,8 @@ pub struct ClientCommandResponse {
     pub op_return: OperationReturn,
 }
 
-const RESPONSE_OP_READ: u8 = 0;
-const RESPONSE_OP_WRITE: u8 = 1;
+const RESPONSE_OP_READ: u32 = 0;
+const RESPONSE_OP_WRITE: u32 = 1;
 
 pub enum ClientResponseOpType
 {
@@ -302,16 +302,16 @@ impl ClientCommandResponse
     ) -> Vec<u8>
     {
         let mut bytes: Vec<u8> = Vec::new();
-        bytes.push(status as u8);
+        bytes.extend_from_slice(&(status as u32).to_be_bytes());
         bytes.extend_from_slice(&request_identifier.to_be_bytes());
 
         match op_type
         {
             ClientResponseOpType::OpRead => {
-                bytes.push(RESPONSE_OP_READ);
+                bytes.extend_from_slice(&RESPONSE_OP_READ.to_be_bytes());
             },
             ClientResponseOpType::OpWrite => {
-                bytes.push(RESPONSE_OP_WRITE);
+                bytes.extend_from_slice(&RESPONSE_OP_WRITE.to_be_bytes());
             }
         }
         return bytes;
@@ -320,13 +320,13 @@ impl ClientCommandResponse
     pub fn encode(&self) -> Vec<u8>
     {
         let mut bytes: Vec<u8> = Vec::new();
-        bytes.push(self.status as u8);
+        bytes.extend_from_slice(&(self.status as u32).to_be_bytes());
         bytes.extend_from_slice(&self.request_identifier.to_be_bytes());
 
         match &self.op_return
         {
             OperationReturn::Read { read_data } => {
-                bytes.push(RESPONSE_OP_READ);
+                bytes.extend_from_slice(&RESPONSE_OP_READ.to_be_bytes());
                 match self.status
                 {
                     StatusCode::Ok => {
@@ -336,10 +336,9 @@ impl ClientCommandResponse
                         // as data we push zero values
                     }
                 }
-
             },
             OperationReturn::Write => {
-                bytes.push(RESPONSE_OP_WRITE);
+                bytes.extend_from_slice(&RESPONSE_OP_WRITE.to_be_bytes());
             }
         }
 

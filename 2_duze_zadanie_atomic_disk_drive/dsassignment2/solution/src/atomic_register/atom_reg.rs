@@ -13,6 +13,7 @@ use crate::atomic_register_public::{AtomicRegister};
 use crate::sectors_manager_public::SectorsManager;
 use crate::register_client_public::{RegisterClient, Broadcast};
 use crate::register_client_public::Send as RegSend;
+use log::debug;
 
 type TimestampType = u64;
 type WriterRankType = u8;
@@ -44,6 +45,7 @@ impl AtomicRegister for AtomReg
     {
         let header = cmd.header;
         let sector_idx: SectorIdx = header.sector_idx;
+        debug!("AtomicRegister TASK got client cmd for sector: {}", sector_idx);
 
         if sector_idx != self.sector_idx
         {
@@ -59,10 +61,11 @@ impl AtomicRegister for AtomReg
         match content
         {
             ClientRegisterCommandContent::Read => {
+                debug!("AtomicRegister got READ cmd for sector: {}, preparing for read", sector_idx);
                 self.reg_state.prepare_for_read();
             },
             ClientRegisterCommandContent::Write { data } => {
-
+                debug!("AtomicRegister got WRITE cmd for sector: {}, preparing for write", sector_idx);
                 self.reg_state.prepare_for_write(data);
             }
         }
@@ -404,6 +407,8 @@ impl AtomReg
     {
         if let Some(op_id) = self.reg_state.op_id
         {
+            debug!("Got ACK for op_id: {}", op_id);
+
             if op_id != recv_header.msg_ident 
             || !self.reg_state.write_phase
             {
@@ -415,6 +420,9 @@ impl AtomReg
             if self.reg_state.acklist.len() > (self.processes_count / 2) as usize
             && (self.reg_state.reading || self.reg_state.writing)
             {
+
+                debug!("Got enough ACKs ({}) for op_id: {}", self.reg_state.acklist.len(), op_id);
+
                 let client_callback: SuccessCallbackFunc = self.success_callback
                     .take()
                     .expect("AtomReg::handle_ack - self.success_callback is NONE, but it shouldn't be since we need to send result to client");
@@ -426,10 +434,13 @@ impl AtomReg
     
                 if self.reg_state.reading
                 {
+                    debug!("Returning READ Response");
                     self.reg_state.reading = false;
                     let readval = self.reg_state.readval
                     .take()
                     .expect("AtomReg::handle_ack - self.reg_state.readval is NONE but it shouldn't be since we are responding to READ request");
+
+                    debug!("READVAL: {:?}", readval);
     
                     response = ClientCommandResponse {
                         status: StatusCode::Ok,
@@ -440,12 +451,14 @@ impl AtomReg
                 else
                 {
                     self.reg_state.writing = false;
-    
+                    
                     response = ClientCommandResponse {
                         status: StatusCode::Ok,
                         request_identifier: request_id,
                         op_return: OperationReturn::Write 
                     };
+
+                    debug!("Returning OK WRITE Response: {:?}", response);
                 }
     
                 client_callback(response).await;
