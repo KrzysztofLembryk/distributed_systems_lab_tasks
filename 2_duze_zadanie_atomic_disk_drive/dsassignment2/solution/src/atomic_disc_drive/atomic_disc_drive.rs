@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::{TcpStream};
 use tokio::time::{sleep, Duration};
 use std::io::{ErrorKind};
@@ -9,7 +10,6 @@ use tokio::sync::{Mutex, MutexGuard};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 
 use crate::atomic_register::atom_reg::spawn_atomic_register_task;
-use crate::{DecodingError};
 use crate::transfer_public::{deserialize_register_command, serialize_client_response, serialize_client_error_response};
 use crate::domain::{SectorIdx, Configuration, SystemRegisterCommand, ClientRegisterCommand, RegisterCommand, ClientCommandResponse, StatusCode, ClientResponseOpType};
 use crate::sectors_manager_public::{build_sectors_manager, SectorsManager};
@@ -135,7 +135,7 @@ impl AtomicDiscDrive
 }
 
 fn spawn_task_to_handle_connection(
-    mut conn_socket: TcpStream,
+    conn_socket: TcpStream,
     n_sectors: u64,
     self_rank: u8,
     n_proc: u8,
@@ -147,98 +147,126 @@ fn spawn_task_to_handle_connection(
 )
 {
     tokio::spawn(async move {
+        let (mut read_socket, write_socket) = tokio::io::split(conn_socket);
+        let write_socket = Arc::new(Mutex::new(write_socket));
         let mut sectors_txs: SectorSysClientTxMap = HashMap::new();
+
         loop 
         {
-            match deserialize_register_command(
-                &mut conn_socket,
-                &hmac_system_key,
-                &hmac_client_key
-            ).await {
-                Ok((cmd, is_hmac_valid)) => {
-                    if !is_hmac_valid 
-                    {
-                        // System messages should never have invalid HMAC since our 
-                        // implementation takes care of that
-                        handle_invalid_hmac(
-                            cmd, 
-                            &mut conn_socket, 
-                            &hmac_client_key
-                        ).await;
-                        // we encounter invalid msg we end connection
-                        return;
-                    }
-                    else
-                    {
-                        match cmd {
-                            RegisterCommand::Client(c_cmd) => {
-                                debug!("Got client command");
-                                handle_client_cmd(
-                                    conn_socket,
-                                    c_cmd, 
-                                    all_present_sectors.clone(),
-                                    sectors_manager.clone(), 
-                                    register_client.clone(),
-                                    hmac_client_key.clone(),
-                                    self_rank,
-                                    n_sectors,
-                                    n_proc,
-                                ).await;
-                                // If client connects to us, we pass ownership of 
-                                // his socket to AtomicRegister, which will send him
-                                // value once it gets result. So we can safely end 
-                                // this task here
-                                return;
-                            },
-                            RegisterCommand::System(s_cmd) => {
-                                // This means that we will be only getting messages 
-                                // from other system processes, we might drop this
-                                // connection when malicious process sends request
-                                // about sector that doesn't exist (idx >= n_sectors)
-                                match handle_sys_cmd(
-                                    s_cmd, 
-                                    &mut sectors_txs,
-                                    all_present_sectors.clone(),
-                                    sectors_manager.clone(), 
-                                    register_client.clone(),
-                                    self_rank,
-                                    n_sectors,
-                                    n_proc,
-                                ).await
-                                {
-                                    Ok(_) => {},
-                                    Err(e) => {
-                                        warn!("When handling sys_cmd from other process we got error: '{}', ENDING CONNECTION", e);
-                                        return;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }    
+            match handle_connection(
+                &mut read_socket, 
+                write_socket.clone(),
+                n_sectors, 
+                self_rank, 
+                n_proc, 
+                hmac_system_key.clone(), 
+                hmac_client_key.clone(), 
+                sectors_manager.clone(), 
+                &mut sectors_txs, 
+                all_present_sectors.clone(), 
+                register_client.clone()
+            ).await
+            {
+                Ok(_) => {},
                 Err(e) => {
-                    warn!("deserialize_register_command returned error: {:?}", e);
-                    match e
-                    {
-                        DecodingError::IoError(e) => {
-                            warn!("We've got IO erorr, ending this connection, err: {:?}", e);
-                            return;
-                        }
-                        other_e => {
-                            // Either InvalidMsg or BinCodeError, 
-                            warn!("Recv Message is invalid, ending this connection, err: {:?}", other_e);
-                            return;
+                    error!("In handle_connection we got error: {:?}", e);
+                    // if any error occured we end connection
+                    return;
+                }
+            }
+    }
+    }
+    );
+}
+
+async fn handle_connection(
+    read_socket: &mut ReadHalf<TcpStream>,
+    write_socket: Arc<Mutex<WriteHalf<TcpStream>>>,
+    n_sectors: u64,
+    self_rank: u8,
+    n_proc: u8,
+    hmac_system_key: Arc<[u8; 64]>,
+    hmac_client_key: Arc<[u8; 32]>,
+    sectors_manager: Arc<dyn SectorsManager>,
+    sectors_txs: &mut SectorSysClientTxMap,
+    all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
+    register_client: Arc<RegClient>,
+) -> Result<(), String>
+{
+    match deserialize_register_command(
+        read_socket, 
+        &hmac_system_key, 
+        &hmac_client_key
+    ).await {
+        Ok((cmd, is_hmac_valid)) => {
+            if !is_hmac_valid 
+            {
+                // System messages should never have invalid HMAC 
+                // since our implementation takes care of that
+                handle_invalid_hmac(
+                    cmd, 
+                    write_socket, 
+                    &hmac_client_key
+                ).await;
+                // We encounter invalid msg so we end connection
+                return Err(format!("Invalid hmac err"));
+            }
+            else
+            {
+                match cmd {
+                    RegisterCommand::Client(c_cmd) => {
+                        handle_client_cmd(
+                            write_socket,
+                            c_cmd, 
+                            sectors_txs,
+                            all_present_sectors.clone(),
+                            sectors_manager.clone(), 
+                            register_client.clone(),
+                            hmac_client_key.clone(),
+                            self_rank,
+                            n_sectors,
+                            n_proc,
+                        ).await?;
+                    },
+                    RegisterCommand::System(s_cmd) => {
+                        // This means that we will be only getting 
+                        // messages from other system processes, we 
+                        // might drop this connection when malicious 
+                        // process sends request about sector that 
+                        // doesn't exist (idx >= n_sectors)
+                        match handle_sys_cmd(
+                            s_cmd, 
+                            sectors_txs,
+                            all_present_sectors.clone(),
+                            sectors_manager.clone(), 
+                            register_client.clone(),
+                            self_rank,
+                            n_sectors,
+                            n_proc,
+                        ).await
+                        {
+                            Ok(_) => {},
+                            Err(e) => {
+                                return Err(format!(
+                                    "When handling sys_cmd from other process we got error: '{}', ENDING CONNECTION", e
+                                ));
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+        Err(e) => {
+            return Err(format!("In spawned connection task, when deserializing ClientCmd we got error: {:?}", e)); 
+        },
+    }
+    return Ok(());
 }
 
 async fn handle_client_cmd(
-    mut conn_socket: TcpStream,
+    write_socket: Arc<Mutex<WriteHalf<TcpStream>>>,
     c_cmd: ClientRegisterCommand,
+    sectors_txs: &mut SectorSysClientTxMap,
     all_present_sectors: Arc<Mutex<SectorSysClientTxMap>>,
     sectors_manager: Arc<dyn SectorsManager>,
     register_client: Arc<RegClient>,
@@ -246,7 +274,7 @@ async fn handle_client_cmd(
     self_rank: u8,
     n_sectors: u64,
     n_proc: u8,
-)
+) -> Result<(), String>
 {
     let sector_idx = c_cmd.get_sector_idx();
 
@@ -256,63 +284,84 @@ async fn handle_client_cmd(
         let request_id = c_cmd.header.request_identifier;
         let op_type: ClientResponseOpType = c_cmd.get_op_type();
 
+        let mut write_socket_lock = write_socket.lock().await;
+
         match serialize_client_error_response(
             status, 
             request_id, 
             op_type, 
-            &mut conn_socket, 
+            &mut *write_socket_lock, 
             &(*hmac_client_key)
         ).await
         {
             Ok(_) => {},
-            Err(e) => {warn!("In handle_client_cmd we got error during serialization:{:?}", e);}
+            Err(e) => {
+                return Err(format!("In handle_client_cmd we got error during serialization:{:?}", e));
+            }
         }
+        drop(write_socket_lock);
         // We end connection
-        return;
+        return Err(format!("In handle_client_cmd - sector: {} is invalid, max allowed sector: {}", sector_idx, n_sectors));
     }
 
-    // if we have this sector in our sectors_txs map, this means that there is a task
-    // for this sector, so we can safely send msg to it
-    let mut present_sectors_lock = all_present_sectors.lock().await;
 
-    // If we don't have txs for given sector in our map, we check if other tcp
-    // receiver task has spawned it and added it to present_sectors_lock
-    if let Some((_sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+    if let Some((_, client_cmd_tx)) = sectors_txs.get(&sector_idx)
     {
-        // If it is in this shared map, we send msg to it and save txs to this 
-        // sector to our internal map
-
-        debug!("Sending client cmd to sector task");
+        // if we have this sector in our sectors_txs map, this means that there is a 
+        // task for this sector, so we can safely send msg to it
         send_client_cmd_to_sector_task(
-            conn_socket, 
+            write_socket, 
             c_cmd, 
-            hmac_client_key.clone(), 
-            &client_cmd_tx
+            &client_cmd_tx,
+            hmac_client_key
         );
     }
-    else
+    else 
     {
-        debug!("handle_client_cmd: no task for sector: {} yet, will create it", sector_idx);
-        // If there isnt a task for this sector we spawn it, insert it to shared
-        // map. Spawn sector function insert txs to shared map
-        let (_sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
-            &mut present_sectors_lock, 
-            sectors_manager, 
-            register_client, 
-            self_rank, 
-            sector_idx, 
-            n_proc
-        ); 
+        let mut present_sectors_lock = all_present_sectors.lock().await;
+    
+        // If we don't have txs for given sector in our map, we check if other tcp
+        // receiver task has spawned it and added it to present_sectors_lock
+        if let Some((sys_cmd_tx, client_cmd_tx)) = present_sectors_lock.get(&sector_idx)
+        {
+            
+            // If it is in this shared map, we send msg to it and save txs to this 
+            // sector to our internal map
+            send_client_cmd_to_sector_task(
+                write_socket, 
+                c_cmd, 
+                &client_cmd_tx,
+                hmac_client_key
+            );
 
-        drop(present_sectors_lock);
+            sectors_txs.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
+        }
+        else
+        {
+            // If there isnt a task for this sector we spawn it, insert it to shared
+            // map. Spawn sector function insert txs to shared map
+            let (sys_cmd_tx, client_cmd_tx) = spawn_sector_task(
+                &mut present_sectors_lock, 
+                sectors_manager, 
+                register_client, 
+                self_rank, 
+                sector_idx, 
+                n_proc
+            ); 
+    
+            drop(present_sectors_lock);
+    
+            send_client_cmd_to_sector_task(
+                write_socket, 
+                c_cmd, 
+                &client_cmd_tx,
+                hmac_client_key
+            );
 
-        send_client_cmd_to_sector_task(
-            conn_socket, 
-            c_cmd, 
-            hmac_client_key.clone(), 
-            &client_cmd_tx
-        );
+            sectors_txs.insert(sector_idx, (sys_cmd_tx.clone(), client_cmd_tx.clone()));
+        }
     }
+    return Ok(());
 }
 
 async fn handle_sys_cmd(
@@ -431,10 +480,10 @@ fn send_sys_cmd_to_sector_task(
 }
 
 fn send_client_cmd_to_sector_task(
-    mut conn_socket: TcpStream,
+    write_socket: Arc<Mutex<WriteHalf<TcpStream>>>,
     c_cmd: ClientRegisterCommand,
+    sector_tx: &UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>,
     hmac_client_key: Arc<[u8; 32]>,
-    client_cmd_tx: &UnboundedSender<(Box<ClientRegisterCommand>, SuccessCallbackFunc)>,
 )
 {
     let sector_idx = c_cmd.get_sector_idx();
@@ -442,24 +491,24 @@ fn send_client_cmd_to_sector_task(
     let callback_func: SuccessCallbackFunc = Box::new(
         move |response: ClientCommandResponse| {
             return Box::pin(async move {
-                debug!("SuccessCallback - serialize client response: {:?}", response);
-                let fut = serialize_client_response(
-                    &response, 
-                    &mut conn_socket, 
-                    hmac_client_key.as_ref()
-                );
-                let _ = fut.await;
 
-                debug!("SuccessCallback - conn_socket should be dropped here");
-            });
-        }
+                let mut write_socket_lock = write_socket.lock().await;
+                // We ignore result since socket might be already closed since 
+                // i.e. client send invalid message and task dropped connection
+                // or client just disconnected
+                let _ = serialize_client_response(
+                    &response, 
+                    &mut *write_socket_lock, 
+                    hmac_client_key.as_ref()
+                ).await;
+            } // lock dropped here
+        );}
     );
 
-    debug!("AtomicDiscDrive::send_clinet_cmd_to_sector_task: Sending ClinetCMd to sector");
     // This should never return error since our atomic register once its spawned
     // will run indefinitely, but if this somehow happens this means that atomic
     // register is closed so task has ended so we need to respawn it
-    match client_cmd_tx.send((Box::new(c_cmd), callback_func))
+    match sector_tx.send((Box::new(c_cmd), callback_func))
     {
         Ok(_) => {},
         Err(e) => {
@@ -476,7 +525,7 @@ fn is_valid_sector(cmd_sector: u64, n_sectors: u64) -> bool
 
 async fn handle_invalid_hmac(
     cmd: RegisterCommand,
-    conn_socket: &mut TcpStream,
+    write_socket: Arc<Mutex<WriteHalf<TcpStream>>>,
     hmac_client_key: &[u8; 32],
 )
 {
@@ -489,12 +538,13 @@ async fn handle_invalid_hmac(
             let request_identifier = client_cmd.header.request_identifier;
 
             let op_type: ClientResponseOpType = client_cmd.get_op_type();
+            let mut write_socket_lock = write_socket.lock().await;
 
             match serialize_client_error_response(
                 status, 
                 request_identifier,
                 op_type,
-                conn_socket, 
+                &mut *write_socket_lock, 
                 &*hmac_client_key
             ).await
             {

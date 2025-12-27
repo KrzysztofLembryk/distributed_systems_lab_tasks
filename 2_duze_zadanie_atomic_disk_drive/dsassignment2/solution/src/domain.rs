@@ -86,6 +86,11 @@ pub struct ClientRegisterCommand {
 
 impl ClientRegisterCommand 
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        return self.header.get_size_in_bytes() + self.content.get_size_in_bytes();
+    }
+
     pub fn get_op_type(&self) -> ClientResponseOpType
     {
         let op_type: ClientResponseOpType = match self.content {
@@ -115,6 +120,10 @@ pub struct SystemRegisterCommand {
 
 impl SystemRegisterCommand
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        return self.header.get_size_in_bytes() + self.content.get_size_in_bytes();
+    }
     pub fn get_sector_idx(&self) -> u64
     {
         return self.header.sector_idx;
@@ -145,9 +154,6 @@ pub enum SystemRegisterCommandContent {
     },
     /// Acknowledgement of the processing completion
     Ack,
-    // MsgRecvAck {
-    //     msg_type: 
-    // },
 }
 
 pub const SYS_READ_PROC_CMD_ID: u32 = 0;
@@ -157,6 +163,30 @@ pub const SYS_ACK_CMD_ID: u32 = 3;
 
 impl SystemRegisterCommandContent
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        return match self {
+            SystemRegisterCommandContent::ReadProc => {
+                std::mem::size_of_val(&SYS_READ_PROC_CMD_ID)
+            },
+            SystemRegisterCommandContent::Value { timestamp, write_rank, .. } => {
+                std::mem::size_of_val(&SYS_VALUE_CMD_ID)
+                + std::mem::size_of_val(timestamp)
+                + std::mem::size_of_val(write_rank)
+                + SECTOR_SIZE
+            },
+            SystemRegisterCommandContent::WriteProc { timestamp, write_rank, .. } => {
+                std::mem::size_of_val(&SYS_WRITE_PROC_CMD_ID)
+                + std::mem::size_of_val(timestamp)
+                + std::mem::size_of_val(write_rank)
+                + SECTOR_SIZE
+            },
+            SystemRegisterCommandContent::Ack => {
+                std::mem::size_of_val(&SYS_ACK_CMD_ID)
+            }
+        };
+    }
+
     pub fn encode(&self) -> Vec<u8>
     {
         debug!("SystemRegisterCommandContent::encode");
@@ -209,6 +239,19 @@ pub const CLIENT_WRITE_CMD_ID: u32 = 1;
 
 impl ClientRegisterCommandContent
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        match self
+        {
+            ClientRegisterCommandContent::Read => {
+                return std::mem::size_of_val(&CLIENT_READ_CMD_ID);
+            },
+            ClientRegisterCommandContent::Write { .. } => {
+                return std::mem::size_of_val(&CLIENT_WRITE_CMD_ID)
+                + SECTOR_SIZE;
+            }
+        }
+    }
     pub fn encode(&self) -> Vec<u8>
     {
         debug!("ClientRegisterCommandContent::encode");
@@ -237,6 +280,11 @@ pub struct ClientCommandHeader {
 
 impl ClientCommandHeader
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        return std::mem::size_of_val(&self.request_identifier) 
+        + std::mem::size_of_val(&self.sector_idx);
+    }
     pub fn encode(&self) -> Vec<u8>
     {
         debug!("ClientCommandHeader::encode");
@@ -261,6 +309,12 @@ pub const MSG_IDENT_LEN: u64 = 16;
 
 impl SystemCommandHeader
 {
+    pub fn get_size_in_bytes(&self) -> usize
+    {
+        return std::mem::size_of_val(&self.process_identifier)
+        + std::mem::size_of_val(&self.msg_ident)
+        + std::mem::size_of_val(&self.sector_idx);
+    }
     pub fn encode(&self) -> Vec<u8>
     {
         debug!("SystemCommandHeader::encode");

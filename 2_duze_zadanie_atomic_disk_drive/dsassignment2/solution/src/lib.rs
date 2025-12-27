@@ -147,10 +147,15 @@ pub mod transfer_public {
         hmac_client_key: &[u8; 32],
     ) -> Result<(RegisterCommand, bool), DecodingError> 
     {
+        debug!("deserialize_register_command creating new reader");
         let mut reader = CmdDeserializer::new(data);
         // cmd_size is payload + Hmac
+
+        // 
+        debug!("deserialize_register_command reading cmd_size");
         let read_cmd_size = reader.read_cmd_size_u64().await?;
         // Either SystemRegisterCommand or ClientRegisterCommand
+        debug!("deserialize_register_command reading cmd_type");
         let cmd_type = reader.read_u32().await?;
 
         match cmd_type

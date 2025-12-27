@@ -142,7 +142,7 @@ async fn single_process_system_completes_operation_write_read() {
         .read_exact(&mut buf)
         .await
         .expect("Less data then expected");
-
+    debug!("TEST - read data from stream");
     // asserts for write response
     let cmp_bytes = expected_len - HMAC_TAG_SIZE;
     assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
