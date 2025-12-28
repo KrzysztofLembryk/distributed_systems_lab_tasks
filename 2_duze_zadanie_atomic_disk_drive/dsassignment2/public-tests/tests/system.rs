@@ -1,8 +1,5 @@
 use assignment_2_solution::{
-    ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, Configuration,
-    OperationReturn, PublicConfiguration, RegisterCommand, SectorVec, run_register_process,
-    serialize_register_command,
-    deserialize_register_command,
+    ClientCommandHeader, ClientRegisterCommand, ClientRegisterCommandContent, Configuration, OperationReturn, PublicConfiguration, RegisterCommand, SECTOR_SIZE, SectorVec, deserialize_register_command, run_register_process, serialize_register_command
 };
 use assignment_2_test_utils::system::*;
 use assignment_2_test_utils::transfer::PacketBuilder;
@@ -22,6 +19,148 @@ fn init_logger() {
         .is_test(true)
         .filter_level(log::LevelFilter::Debug)
         .try_init();
+}
+
+#[tokio::test]
+#[timeout(6000)]
+async fn two_processes_double_write_same_sector() {
+    let hmac_client_key = [5; 32];
+    let tcp_ports = [31410, 31411];
+    let storage_dir1 = tempdir().unwrap();
+    let storage_dir2 = tempdir().unwrap();
+    let request_identifier = 9000;
+
+    // Spawn two register processes
+    let config1 = Configuration {
+        public: PublicConfiguration {
+            tcp_locations: tcp_ports
+                .iter()
+                .map(|port| ("127.0.0.1".to_string(), *port))
+                .collect(),
+            self_rank: 1,
+            n_sectors: 20,
+            storage_dir: storage_dir1.keep(),
+        },
+        hmac_system_key: [1; 64],
+        hmac_client_key,
+    };
+    let config2 = Configuration {
+        public: PublicConfiguration {
+            tcp_locations: tcp_ports
+                .iter()
+                .map(|port| ("127.0.0.1".to_string(), *port))
+                .collect(),
+            self_rank: 2,
+            n_sectors: 20,
+            storage_dir: storage_dir2.keep(),
+        },
+        hmac_system_key: [1; 64],
+        hmac_client_key,
+    };
+
+    tokio::spawn(run_register_process(config1));
+    tokio::spawn(run_register_process(config2));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect client to process 1
+    let mut stream = TcpStream::connect(("127.0.0.1", tcp_ports[0]))
+        .await
+        .expect("Could not connect to TCP port");
+
+    // --- First WRITE (value 1) ---
+    let write_cmd_1 = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(Box::new(Array([1; 4096]))),
+        },
+    });
+
+    send_cmd(&write_cmd_1, &mut stream, &hmac_client_key).await;
+
+    // Check write response
+    let mut expected_1 = PacketBuilder::new();
+    expected_1.add_u64(0); // size placeholder
+    expected_1.add_u32(0); // Status ok
+    expected_1.add_u64(request_identifier);
+    expected_1.add_u32(1); // OperationReturn::Write
+    expected_1.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected_1.update_size();
+    let expected_len_1 = expected_1.as_slice().len();
+
+    let mut buf_1 = vec![0u8; expected_len_1];
+    stream
+        .read_exact(&mut buf_1)
+        .await
+        .expect("Less data than expected");
+    let cmp_bytes_1 = expected_len_1 - HMAC_TAG_SIZE;
+    assert_eq!(buf_1[..cmp_bytes_1], expected_1.as_slice()[..cmp_bytes_1]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf_1[8..]));
+
+    // --- Second WRITE (value 69) ---
+    let write_cmd_2 = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier: request_identifier + 1,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(Box::new(Array([69; 4096]))),
+        },
+    });
+
+    send_cmd(&write_cmd_2, &mut stream, &hmac_client_key).await;
+
+    // Check write response
+    let mut expected_2 = PacketBuilder::new();
+    expected_2.add_u64(0); // size placeholder
+    expected_2.add_u32(0); // Status ok
+    expected_2.add_u64(request_identifier + 1);
+    expected_2.add_u32(1); // OperationReturn::Write
+    expected_2.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected_2.update_size();
+    let expected_len_2 = expected_2.as_slice().len();
+
+    let mut buf_2 = vec![0u8; expected_len_2];
+    stream
+        .read_exact(&mut buf_2)
+        .await
+        .expect("Less data than expected");
+    let cmp_bytes_2 = expected_len_2 - HMAC_TAG_SIZE;
+    assert_eq!(buf_2[..cmp_bytes_2], expected_2.as_slice()[..cmp_bytes_2]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf_2[8..]));
+
+    // --- READ (should get value 69) ---
+    let read_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier: request_identifier + 2,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Read,
+    });
+
+    send_cmd(&read_cmd, &mut stream, &hmac_client_key).await;
+
+    let mut expected_read = PacketBuilder::new();
+    expected_read.add_u64(0); // size placeholder
+    expected_read.add_u32(0); // Status ok
+    expected_read.add_u64(request_identifier + 2);
+    expected_read.add_u32(0); // OperationReturn::Read
+    expected_read.add_slice(&[69; 4096]); // sector data
+    expected_read.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected_read.update_size();
+    let expected_read_len = expected_read.as_slice().len();
+
+    let mut buf_read = vec![0u8; expected_read_len];
+    stream
+        .read_exact(&mut buf_read)
+        .await
+        .expect("Less data than expected");
+
+    let cmp_bytes_read = expected_read_len - HMAC_TAG_SIZE;
+    assert_eq!(buf_read[..cmp_bytes_read], expected_read.as_slice()[..cmp_bytes_read]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf_read[8..]));
 }
 
 #[tokio::test]
@@ -696,17 +835,20 @@ async fn concurrent_operations_on_the_same_sector()
     }
 }
 
+
 #[tokio::test]
 #[serial_test::serial]
-#[timeout(40000)]
-async fn large_number_of_operations_execute_successfully() {
+#[timeout(30000)]
+async fn large_number_of_operations_execute_successfully_3_procs() {
     // given
+    init_logger();
     let port_range_start = 21625;
     let commands_total = 32;
     let config = TestProcessesConfig::new(3, port_range_start);
     config.start().await;
     let mut stream = config.connect(2).await;
 
+    debug!("TEST - sending first WRITE");
     for cmd_idx in 0..commands_total {
         config
             .send_cmd(
@@ -724,12 +866,15 @@ async fn large_number_of_operations_execute_successfully() {
             .await;
     }
 
+    debug!("TEST - reading WRITE responses");
     for _ in 0..commands_total {
         config.read_response(&mut stream).await;
     }
 
     // when
+    debug!("TEST - sending READ");
     for cmd_idx in 0..commands_total {
+
         config
             .send_cmd(
                 &RegisterCommand::Client(ClientRegisterCommand {
@@ -745,7 +890,84 @@ async fn large_number_of_operations_execute_successfully() {
     }
 
     // then
+    for idx in 0..commands_total {
+
+        debug!("TEST - reading READ responses for cmd: {}", idx);
+        let response = config.read_response(&mut stream).await;
+        match response.content.op_return {
+            OperationReturn::Read {
+                read_data: SectorVec(sector),
+            } => {
+                assert_eq!(
+                    sector,
+                    Box::new(Array(
+                        [(response.content.request_identifier - 256) as u8; 4096]
+                    ))
+                )
+            }
+            _ => panic!("Expected read response"),
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+// this test may take a verrrryyyy long time
+// #[timeout(90000)]
+async fn large_number_of_operations_execute_successfully_10_procs() {
+    // given
+    init_logger();
+    let port_range_start = 21625;
+    let commands_total = 32;
+    let config = TestProcessesConfig::new(10, port_range_start);
+    config.start().await;
+    let mut stream = config.connect(2).await;
+
+    debug!("TEST - sending first WRITE");
+    for cmd_idx in 0..commands_total {
+        config
+            .send_cmd(
+                &RegisterCommand::Client(ClientRegisterCommand {
+                    header: ClientCommandHeader {
+                        request_identifier: cmd_idx,
+                        sector_idx: cmd_idx,
+                    },
+                    content: ClientRegisterCommandContent::Write {
+                        data: SectorVec(Box::new(Array([cmd_idx as u8; 4096]))),
+                    },
+                }),
+                &mut stream,
+            )
+            .await;
+    }
+
+    debug!("TEST - reading WRITE responses");
     for _ in 0..commands_total {
+        config.read_response(&mut stream).await;
+    }
+
+    // when
+    debug!("TEST - sending READ");
+    for cmd_idx in 0..commands_total {
+
+        config
+            .send_cmd(
+                &RegisterCommand::Client(ClientRegisterCommand {
+                    header: ClientCommandHeader {
+                        request_identifier: cmd_idx + 256,
+                        sector_idx: cmd_idx,
+                    },
+                    content: ClientRegisterCommandContent::Read,
+                }),
+                &mut stream,
+            )
+            .await;
+    }
+
+    // then
+    for idx in 0..commands_total {
+
+        debug!("TEST - reading READ responses for cmd: {}", idx);
         let response = config.read_response(&mut stream).await;
         match response.content.op_return {
             OperationReturn::Read {
@@ -1512,6 +1734,247 @@ async fn two_processes_write_then_crash_and_recover_read()
     assert_eq!(buf_read[..cmp_bytes_read], expected_read.as_slice()[..cmp_bytes_read]);
     assert!(hmac_tag_is_ok(&hmac_client_key, &buf_read[8..]));
 }
+
+#[tokio::test]
+#[serial_test::serial]
+#[timeout(60000)]
+async fn system_write_before_and_during_crash_read_after_recovery() 
+{
+    init_logger();
+    let hmac_client_key = [5; 32];
+    let tcp_ports = [31210, 31211];
+    let storage_dir1 = tempdir().unwrap();
+    let request_identifier = 4242;
+
+    // Prepare configs
+    let config1 = Configuration {
+        public: PublicConfiguration {
+            tcp_locations: tcp_ports
+                .iter()
+                .map(|port| ("127.0.0.1".to_string(), *port))
+                .collect(),
+            self_rank: 1,
+            n_sectors: 20,
+            storage_dir: storage_dir1.keep(),
+        },
+        hmac_system_key: [1; 64],
+        hmac_client_key,
+    };
+
+    let _ = tokio::spawn(run_register_process(config1));
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Connect client to process 1
+    let mut stream = TcpStream::connect(("127.0.0.1", tcp_ports[0]))
+        .await
+        .expect("Could not connect to TCP port");
+
+    // --- WRITE BEFORE CRASH ---
+    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(Box::new(Array([9; SECTOR_SIZE]))),
+        },
+    });
+
+    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
+
+    // Check write response
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0); // size placeholder
+    expected.add_u32(0); // Status ok
+    expected.add_u64(request_identifier);
+    expected.add_u32(1); // OperationReturn::Write
+    expected.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Less data than expected");
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf[8..]));
+
+    debug!("Write cmd passed, NOW IS THE TIME TO CRASH PROCESS");
+    // --- MANUALLY crash process 2 ---
+    tokio::time::sleep(Duration::from_millis(7000)).await;
+
+    debug!("Proc 2 should be crashed, sending WRITE");
+
+    // --- WRITE DURING CRASH ---
+    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(Box::new(Array([69; SECTOR_SIZE]))),
+        },
+    });
+
+    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
+
+    debug!("WRITE is sent, now do the RECOVERY");
+    // Check write response
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0); // size placeholder
+    expected.add_u32(0); // Status ok
+    expected.add_u64(request_identifier);
+    expected.add_u32(1); // OperationReturn::Write
+    expected.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Less data than expected");
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf[8..]));
+
+    // Sending READ - both processes should be up
+    let read_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier: request_identifier + 1,
+            sector_idx: 7,
+        },
+        content: ClientRegisterCommandContent::Read,
+    });
+
+    send_cmd(&read_cmd, &mut stream, &hmac_client_key).await;
+
+    // Restore manually other process
+
+    // --- Read response should still be correct ---
+    let mut expected_read = PacketBuilder::new();
+    expected_read.add_u64(0); // size placeholder
+    expected_read.add_u32(0); // Status ok
+    expected_read.add_u64(request_identifier + 1);
+    expected_read.add_u32(0); // OperationReturn::Read
+    expected_read.add_slice(&[9; 4096]); // sector data
+    expected_read.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected_read.update_size();
+    let expected_read_len = expected_read.as_slice().len();
+
+    let mut buf_read = vec![0u8; expected_read_len];
+    stream
+        .read_exact(&mut buf_read)
+        .await
+        .expect("Less data than expected");
+
+    let cmp_bytes_read = expected_read_len - HMAC_TAG_SIZE;
+    assert_eq!(buf_read[..cmp_bytes_read], expected_read.as_slice()[..cmp_bytes_read]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf_read[8..]));
+}
+
+#[tokio::test]
+#[timeout(6000)]
+async fn minority_failure_does_not_stop_system() {
+    // given
+    let hmac_client_key = [5; 32];
+    let tcp_ports = [31310, 31311, 31312, 31313, 31314]; // 5 addresses
+    let mut storage_dirs: Vec<_> = (0..3).map(|_| tempdir().unwrap()).collect();
+    let request_identifier = 2025;
+
+    // Spawn only 3 out of 5 register processes
+    for i in 0..3 {
+        let storage_dir = storage_dirs.remove(0);
+        let config = Configuration {
+            public: PublicConfiguration {
+                tcp_locations: tcp_ports
+                    .iter()
+                    .map(|port| ("127.0.0.1".to_string(), *port))
+                    .collect(),
+                self_rank: (i + 1) as u8,
+                n_sectors: 20,
+                storage_dir: storage_dir.keep(),
+            },
+            hmac_system_key: [1; 64],
+            hmac_client_key,
+        };
+        tokio::spawn(run_register_process(config));
+    }
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    // Connect client to process 1
+    let mut stream = TcpStream::connect(("127.0.0.1", tcp_ports[0]))
+        .await
+        .expect("Could not connect to TCP port");
+
+    // --- WRITE ---
+    let write_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier,
+            sector_idx: 5,
+        },
+        content: ClientRegisterCommandContent::Write {
+            data: SectorVec(Box::new(Array([42; 4096]))),
+        },
+    });
+
+    send_cmd(&write_cmd, &mut stream, &hmac_client_key).await;
+
+    // Check write response
+    let mut expected = PacketBuilder::new();
+    expected.add_u64(0); // size placeholder
+    expected.add_u32(0); // Status ok
+    expected.add_u64(request_identifier);
+    expected.add_u32(1); // OperationReturn::Write
+    expected.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected.update_size();
+    let expected_len = expected.as_slice().len();
+
+    let mut buf = vec![0u8; expected_len];
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("Less data than expected");
+    let cmp_bytes = expected_len - HMAC_TAG_SIZE;
+    assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf[8..]));
+
+    // --- READ ---
+    let read_cmd = RegisterCommand::Client(ClientRegisterCommand {
+        header: ClientCommandHeader {
+            request_identifier: request_identifier + 1,
+            sector_idx: 5,
+        },
+        content: ClientRegisterCommandContent::Read,
+    });
+
+    send_cmd(&read_cmd, &mut stream, &hmac_client_key).await;
+
+    let mut expected_read = PacketBuilder::new();
+    expected_read.add_u64(0); // size placeholder
+    expected_read.add_u32(0); // Status ok
+    expected_read.add_u64(request_identifier + 1);
+    expected_read.add_u32(0); // OperationReturn::Read
+    expected_read.add_slice(&[42; 4096]); // sector data
+    expected_read.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
+    expected_read.update_size();
+    let expected_read_len = expected_read.as_slice().len();
+
+    let mut buf_read = vec![0u8; expected_read_len];
+    stream
+        .read_exact(&mut buf_read)
+        .await
+        .expect("Less data than expected");
+
+    let cmp_bytes_read = expected_read_len - HMAC_TAG_SIZE;
+    assert_eq!(buf_read[..cmp_bytes_read], expected_read.as_slice()[..cmp_bytes_read]);
+    assert!(hmac_tag_is_ok(&hmac_client_key, &buf_read[8..]));
+}
+
 
 async fn send_cmd(register_cmd: &RegisterCommand, stream: &mut TcpStream, hmac_client_key: &[u8]) {
     let mut data = Vec::new();

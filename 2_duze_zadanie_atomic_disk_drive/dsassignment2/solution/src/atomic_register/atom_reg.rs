@@ -287,7 +287,7 @@ impl AtomReg
                 if self.reg_state.readlist.len() > (proc_count / 2)
                 && (self.reg_state.reading || self.reg_state.writing)
                 {
-
+                    debug!("HandleValue: Proc: {}, Sector: {} got majority", self.self_ident, recv_header.sector_idx);
                     self.reg_state.readlist.insert(
                         self.self_ident, 
                         (
@@ -418,6 +418,8 @@ impl AtomReg
             if self.reg_state.acklist.len() > (self.processes_count / 2) as usize
             && (self.reg_state.reading || self.reg_state.writing)
             {
+                debug!("HandleAck: Proc: {}, Sector: {} got majority", self.self_ident, recv_header.sector_idx);
+
                 let client_callback: SuccessCallbackFunc = self.success_callback
                     .take()
                     .expect("AtomReg::handle_ack - self.success_callback is NONE, but it shouldn't be since we need to send result to client");
