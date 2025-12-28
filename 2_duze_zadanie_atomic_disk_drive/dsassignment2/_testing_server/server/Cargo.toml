@@ -1,0 +1,9 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+atomic_drive = {path = "../../solution/", package = "assignment-2-solution"}
+tempfile = "3.24.0"
+tokio = "1.48.0"
