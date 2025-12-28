@@ -5,5 +5,7 @@ edition = "2024"
 
 [dependencies]
 atomic_drive = {path = "../../solution/", package = "assignment-2-solution"}
+env_logger = "0.11.8"
+log = "0.4.29"
 tempfile = "3.24.0"
 tokio = "1.48.0"

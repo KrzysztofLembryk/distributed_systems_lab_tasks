@@ -1841,6 +1841,7 @@ async fn system_write_before_and_during_crash_read_after_recovery()
     assert_eq!(buf[..cmp_bytes], expected.as_slice()[..cmp_bytes]);
     assert!(hmac_tag_is_ok(&hmac_client_key, &buf[8..]));
 
+    debug!("TEST - Sending READ");
     // Sending READ - both processes should be up
     let read_cmd = RegisterCommand::Client(ClientRegisterCommand {
         header: ClientCommandHeader {
@@ -1860,7 +1861,7 @@ async fn system_write_before_and_during_crash_read_after_recovery()
     expected_read.add_u32(0); // Status ok
     expected_read.add_u64(request_identifier + 1);
     expected_read.add_u32(0); // OperationReturn::Read
-    expected_read.add_slice(&[9; 4096]); // sector data
+    expected_read.add_slice(&[69; 4096]); // sector data
     expected_read.add_slice(&[0; HMAC_TAG_SIZE]); // hmac placeholder
     expected_read.update_size();
     let expected_read_len = expected_read.as_slice().len();

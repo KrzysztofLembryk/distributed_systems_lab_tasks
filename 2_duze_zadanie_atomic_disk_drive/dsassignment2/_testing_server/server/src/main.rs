@@ -5,6 +5,8 @@ use tempfile::tempdir;
 #[tokio::main]
 async fn main() 
 {
+    init_logger();
+
     let hmac_client_key = [5; 32];
     let tcp_ports = [31210, 31211];
     let storage_dir2 = tempdir().unwrap();
@@ -25,4 +27,11 @@ async fn main()
     };
 
     run_register_process(config2).await;
+}
+
+fn init_logger() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Debug)
+        .try_init();
 }
