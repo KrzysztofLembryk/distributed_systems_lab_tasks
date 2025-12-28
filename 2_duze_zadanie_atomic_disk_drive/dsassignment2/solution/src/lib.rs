@@ -118,7 +118,6 @@ pub mod transfer_public {
     use crate::domain::{CLIENT_READ_CMD_ID, CLIENT_WRITE_CMD_ID, SYS_READ_PROC_CMD_ID, SYS_VALUE_CMD_ID, SYS_WRITE_PROC_CMD_ID, SYS_ACK_CMD_ID,
     MSG_IDENT_LEN, ClientResponseOpType};
     use uuid::Uuid;
-    use log::{debug};
 
     type HmacSha256 = Hmac<Sha256>;
 

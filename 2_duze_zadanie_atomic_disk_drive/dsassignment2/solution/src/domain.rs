@@ -1,7 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
-use log::debug;
 
 pub const SECTOR_SIZE: usize = 4096;
 

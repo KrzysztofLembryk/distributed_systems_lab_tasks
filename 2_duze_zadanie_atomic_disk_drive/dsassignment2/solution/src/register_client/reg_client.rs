@@ -291,38 +291,6 @@ async fn resend_all_msgs(
     }
 }
 
-// TODO: change this func
-async fn try_recv_acks(
-    sector_sys_msg_map: &mut SectorSysMsgHashMap,
-    send_stream: &mut TcpStream,
-) {
-    let start = Instant::now();
-    let mut buf = [0u8; 16 + 8]; // 16 bytes for op_id (Uuid), 8 bytes for sector_idx (u64)
-    loop {
-        if start.elapsed().as_millis() > 100 {
-            break;
-        }
-        // Try to read an ACK (non-blocking)
-        match send_stream.try_read(&mut buf) {
-            Ok(n) if n == 24 => {
-                // Parse sector_idx and op_id from buffer
-                let sector_idx = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-                let op_id = Uuid::from_slice(&buf[8..24]).unwrap();
-                // Remove only if both sector_idx and op_id match
-                if let Some((_, stored_op_id)) = sector_sys_msg_map.get(&(sector_idx as SectorIdx)) {
-                    if *stored_op_id == op_id {
-                        sector_sys_msg_map.remove(&(sector_idx as SectorIdx));
-                    }
-                }
-            }
-            Ok(0) => break, // No more data
-            Ok(_) => continue, // Partial read, skip
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // No data available
-            Err(_) => break, // Other errors, break
-        }
-    }
-}
-
 fn try_recv_new_msgs(
     sector_sys_msg_map: &mut SectorSysMsgHashMap,
     rx: &mut UnboundedReceiver<Arc<SystemRegisterCommand>>
@@ -366,13 +334,4 @@ async fn reconnect(addr: &str, proc_rank: u8) -> TcpStream
             }
         };
     }
-}
-
-async fn bind_socket_for_sending(
-    proc_rank: u8,
-    tcp_locations: &[(String, u16)],
-) -> std::io::Result<TcpStream> {
-    let (host, port) = &tcp_locations[proc_rank as usize];
-    let addr = format!("{}:{}", host, port);
-    return TcpStream::connect(&addr).await;
 }
