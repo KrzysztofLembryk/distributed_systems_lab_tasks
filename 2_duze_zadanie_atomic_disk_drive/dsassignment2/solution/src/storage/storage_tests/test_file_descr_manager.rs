@@ -73,7 +73,7 @@ async fn test_unused_descr_reclaimed_while_waiting_on_semaphore()
 
     task_handle.await.unwrap();
 
-    let open_descr = descr_manager.get_nbr_of_open_descr().await;
+    let open_descr = descr_manager._get_nbr_of_open_descr().await;
 
     assert!(
         open_descr == max_allowed_open_f_descr,
@@ -123,7 +123,7 @@ async fn test_many_reads_on_same_sectors()
         handle.await.unwrap();
     }
 
-    let open_descr = descr_manager.get_nbr_of_open_descr().await;
+    let open_descr = descr_manager._get_nbr_of_open_descr().await;
 
     assert!(
         open_descr == max_allowed_open_f_descr,
@@ -180,7 +180,7 @@ async fn descriptor_usage_skewed_takes_and_givebacks() {
     }
 
     // 3. Check that the number of open descriptors does not exceed the limit
-    let open_descr = descr_manager.get_nbr_of_open_descr().await;
+    let open_descr = descr_manager._get_nbr_of_open_descr().await;
     println!(
         "Test finished. Number of open descriptors: {} (max allowed: {})",
         open_descr, max_allowed_open_f_descr

@@ -208,7 +208,7 @@ impl FileDescriptorManager
         }
     }
 
-    async fn get_nbr_of_open_descr(&self) -> usize
+    async fn _get_nbr_of_open_descr(&self) -> usize
     {
         let collections_lock = self.descr_collections.lock().await;
         return collections_lock.descr_map.len()
