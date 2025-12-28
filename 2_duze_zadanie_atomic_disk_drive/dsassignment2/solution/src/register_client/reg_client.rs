@@ -9,7 +9,7 @@ use tokio::sync::{Mutex};
 use tokio::sync::mpsc::{UnboundedSender, UnboundedReceiver, unbounded_channel};
 
 use crate::atomic_disc_drive::atomic_disc_drive::{SectorSysClientTxMap};
-use crate::SectorIdx;
+use crate::{SectorIdx};
 use crate::transfer_public::{serialize_register_command};
 use crate::domain::{SystemRegisterCommand, RegisterCommand};
 use crate::register_client_public::{Broadcast, RegisterClient};
@@ -70,16 +70,29 @@ impl RegisterClient for RegClient
 
     async fn broadcast(&self, msg: Broadcast)
     {
+        debug!("Broadcast");
         let cmd = msg.cmd;
         let sector_idx = cmd.header.sector_idx;
         let proc_rank = cmd.header.process_identifier;
 
-        self.send_msg_to_internal_sector_if_needed(
-            sector_idx, 
-            proc_rank, 
-            cmd.clone(), 
-            TcpSendType::TcpBroadcast
-        ).await;
+        debug!("Broadcasting msg: {:?}", cmd);
+
+        if !cmd.as_ref().is_finalize_ack()
+        {
+            debug!("Msg is not finalize_ack");
+            // We don't want to broadcast finalize_ack to ourselves since we would 
+            // have infty loop, since handler of finalize would broadcast again etc
+            self.send_msg_to_internal_sector_if_needed(
+                sector_idx, 
+                proc_rank, 
+                cmd.clone(), 
+                TcpSendType::TcpBroadcast
+            ).await;
+        }
+        else
+        {
+            debug!("Msg IS finalize_ack");
+        }
 
         // there is no tcp task for our proc_id
         for (_proc_idx, tcp_task_tx) in &self.tcp_task_tx_map
@@ -243,7 +256,7 @@ fn spawn_tcp_task(
             // ############ WE SEND ALL MSGS WE CAN ############
             // If we received no new messages, we resend previoues ones
             resend_all_msgs(
-                &sector_sys_msg_map, 
+                &mut sector_sys_msg_map, 
                 &mut send_stream, 
                 &hmac_system_key, 
                 &addr, 
@@ -265,18 +278,20 @@ fn spawn_tcp_task(
 }
 
 async fn resend_all_msgs(
-    sector_sys_msg_map: &SectorSysMsgHashMap,
+    sector_sys_msg_map: &mut SectorSysMsgHashMap,
     send_stream: &mut TcpStream,
     hmac_system_key: &[u8; 64],
     addr: &str,
     proc_rank: u8
 )
 {
-    for (sector_idx, (reg_cmd, _)) in sector_sys_msg_map
+    let mut sectors_with_finalize_ack: Vec<u64> = vec![];
+
+    for (sector_idx, (reg_cmd, _)) in sector_sys_msg_map.iter()
     {
         // serialize sends our message since, it writes to send_stream 
         match serialize_register_command(
-            &reg_cmd, 
+            reg_cmd, 
             send_stream, 
             hmac_system_key
         ).await
@@ -288,38 +303,19 @@ async fn resend_all_msgs(
                 continue;
             }
         }
-    }
-}
 
-// TODO: change this func
-async fn try_recv_acks(
-    sector_sys_msg_map: &mut SectorSysMsgHashMap,
-    send_stream: &mut TcpStream,
-) {
-    let start = Instant::now();
-    let mut buf = [0u8; 16 + 8]; // 16 bytes for op_id (Uuid), 8 bytes for sector_idx (u64)
-    loop {
-        if start.elapsed().as_millis() > 100 {
-            break;
+        // If this reg_cmd is finalize_ack we want to send it ONLY ONCE, and then 
+        // remove it from messages we send
+        if reg_cmd.is_finalize_ack()
+        {
+            sectors_with_finalize_ack.push(*sector_idx);
         }
-        // Try to read an ACK (non-blocking)
-        match send_stream.try_read(&mut buf) {
-            Ok(n) if n == 24 => {
-                // Parse sector_idx and op_id from buffer
-                let sector_idx = u64::from_le_bytes(buf[0..8].try_into().unwrap());
-                let op_id = Uuid::from_slice(&buf[8..24]).unwrap();
-                // Remove only if both sector_idx and op_id match
-                if let Some((_, stored_op_id)) = sector_sys_msg_map.get(&(sector_idx as SectorIdx)) {
-                    if *stored_op_id == op_id {
-                        sector_sys_msg_map.remove(&(sector_idx as SectorIdx));
-                    }
-                }
-            }
-            Ok(0) => break, // No more data
-            Ok(_) => continue, // Partial read, skip
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break, // No data available
-            Err(_) => break, // Other errors, break
-        }
+    }
+
+    for sector_idx in sectors_with_finalize_ack
+    {
+        debug!("removing finalize ack for sector: {}", sector_idx);
+        sector_sys_msg_map.remove(&sector_idx);
     }
 }
 
@@ -342,10 +338,54 @@ fn try_recv_new_msgs(
         {
             Ok(sys_reg_cmd) => {
                 let sector_idx = sys_reg_cmd.header.sector_idx;
-                let op_id = sys_reg_cmd.header.msg_ident;
+                let this_cmd_op_id = sys_reg_cmd.header.msg_ident;
                 let reg_cmd = RegisterCommand::System((*sys_reg_cmd)
                     .clone());
-                sector_sys_msg_map.insert(sector_idx, (reg_cmd, op_id));
+
+                if reg_cmd.is_finalize_ack()
+                {
+                    debug!("try_recv_new_msgs:: got FINALIZE ACK msg for sector: {}", sector_idx);
+                    if let Some((cmd, other_op_id)) 
+                        = sector_sys_msg_map.get(&sector_idx)
+                    {
+                        // If we have prev msg to this sector we need to check if 
+                        // op_id is correct, if it isnt it means that this is a new 
+                        // cmd, not connected with this finalize_ack so we need to 
+                        // ignore this finalize_ack
+                        if this_cmd_op_id == *other_op_id
+                        {
+                            if cmd.is_finalize_ack()
+                            {
+                                panic!("RegClient::try_recv_new_msgs:: we received finalize_ack cmd, both op_ids are the same BUT prev cmd is also finalize_ack, this should never happen since after sending finalize_ack we should immediately delete it");
+                            }
+                            if !cmd.is_ack()
+                            {
+                                debug!("try_recv_new_msgs:: prev cmd is not ack: {}", sector_idx);
+                                // If op_ids are the same and prev command is not ack
+                                // we insert finalize_ack, since we are the ones who
+                                // started communication and need to send ONCE msg 
+                                // that we ended it
+                                sector_sys_msg_map.insert(sector_idx, (reg_cmd, this_cmd_op_id));
+                            }
+                            else
+                            {
+                                debug!("try_recv_new_msgs:: prev cmd IS ACK: {}", sector_idx);
+                                // If op_ids are the same and prev command is not ack
+                                // If prev command was ack, it means that we were not
+                                // the ones who initiated whole communication, and 
+                                // we got finalize ack, thus we can stop sending acks
+                                // so we remove ACK msg from map.
+                                sector_sys_msg_map.remove(&sector_idx);
+                            }
+                        }
+                    }
+                    // If we don't have prev msg to this sector we ignore this finalize since we are not sending anything regarding this sector
+                }
+                else
+                {
+                    debug!("try_recv_new_msgs:: got msg for sector: {}", sector_idx);
+                    sector_sys_msg_map.insert(sector_idx, (reg_cmd, this_cmd_op_id));
+                }
             },
             Err(_) => {
                 break;
@@ -366,13 +406,4 @@ async fn reconnect(addr: &str, proc_rank: u8) -> TcpStream
             }
         };
     }
-}
-
-async fn bind_socket_for_sending(
-    proc_rank: u8,
-    tcp_locations: &[(String, u16)],
-) -> std::io::Result<TcpStream> {
-    let (host, port) = &tcp_locations[proc_rank as usize];
-    let addr = format!("{}:{}", host, port);
-    return TcpStream::connect(&addr).await;
 }

@@ -118,6 +118,9 @@ impl AtomicRegister for AtomReg
             SystemRegisterCommandContent::Ack => { 
                 self.handle_ack(&recv_header).await;
             }
+            SystemRegisterCommandContent::FinalizeAck => {
+                self.handle_finalize_ack(&recv_header).await;
+            }
         }
     }
 }
@@ -343,6 +346,7 @@ impl AtomReg
                         };
                     }
 
+                    debug!("handle_value:: broadcast");
                     self.register_client.broadcast(
                         Broadcast::new(SystemRegisterCommand {header, content})
                     ).await;
@@ -454,8 +458,41 @@ impl AtomReg
                 }
     
                 client_callback(response).await;
+
+
+                let header = SystemCommandHeader {
+                    process_identifier: self.self_ident,
+                    msg_ident: recv_header.msg_ident,
+                    sector_idx: recv_header.sector_idx
+                };
+
+                // After getting majority and sending response to client we broadcast
+                // finalize ack so that we can end sending msgs, since we have 
+                // completed communication
+                debug!("handle_ack:: Msg to client sent, broadcasting FinalizeAck");
+                self.register_client.broadcast(
+                    Broadcast::new(
+                        SystemRegisterCommand {
+                            header,
+                            content: SystemRegisterCommandContent::FinalizeAck
+                        })
+                ).await;
+
             }
         }
+    }
+
+    async fn handle_finalize_ack(&self, recv_header: &SystemCommandHeader)
+    {
+        // When we get finalize ack as sys command, we just send it to our tcp task
+        self.register_client.send(
+            RegSend::new(
+                SystemRegisterCommand {
+                    header: recv_header.clone(),
+                    content: SystemRegisterCommandContent::FinalizeAck
+                },
+            recv_header.process_identifier)
+        ).await;
     }
 }
 

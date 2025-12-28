@@ -10,6 +10,13 @@ use std::sync::Arc;
 use std::time::Duration;
 use tempfile::tempdir;
 
+fn init_logger() {
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Debug)
+        .try_init();
+}
+
 #[tokio::test]
 #[timeout(200)]
 async fn read_triggers_broadcast() {
@@ -47,6 +54,7 @@ async fn read_triggers_broadcast() {
 #[tokio::test]
 #[timeout(2000)]
 async fn majority_completes_operations_after_crash() {
+    init_logger();
     // given
     let (tx_client, rx_client) = unbounded();
     let (tx_op_c, rx_op_c) = unbounded();

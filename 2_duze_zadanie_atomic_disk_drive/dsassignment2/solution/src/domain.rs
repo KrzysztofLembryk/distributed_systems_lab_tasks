@@ -63,6 +63,35 @@ pub enum RegisterCommand {
     System(SystemRegisterCommand),
 }
 
+impl RegisterCommand
+{
+    pub fn is_ack(&self) -> bool
+    {
+        match self
+        {
+            RegisterCommand::System(s_cmd) => {
+                return s_cmd.is_ack();
+            }
+            RegisterCommand::Client(..) => {
+                return false;
+            }
+        }
+    }
+
+    pub fn is_finalize_ack(&self) -> bool
+    {
+        match self
+        {
+            RegisterCommand::System(s_cmd) => {
+                return s_cmd.is_finalize_ack();
+            }
+            RegisterCommand::Client(..) => {
+                return false;
+            }
+        }
+    }
+}
+
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 /// Repr u8 macro marks this enum as translatable to a single byte. So `Ok` is 0x0,
@@ -120,9 +149,30 @@ pub struct SystemRegisterCommand {
 
 impl SystemRegisterCommand
 {
-    pub fn get_size_in_bytes(&self) -> usize
+    pub fn is_ack(&self) -> bool
     {
-        return self.header.get_size_in_bytes() + self.content.get_size_in_bytes();
+        match self.content
+        {
+            SystemRegisterCommandContent::Ack => {
+                return true;
+            },
+            _ => {
+                return false;
+            }
+        }
+    }
+
+    pub fn is_finalize_ack(&self) -> bool
+    {
+        match self.content
+        {
+            SystemRegisterCommandContent::FinalizeAck => {
+                return true;
+            },
+            _ => {
+                return false;
+            }
+        }
     }
     pub fn get_sector_idx(&self) -> u64
     {
@@ -154,39 +204,20 @@ pub enum SystemRegisterCommandContent {
     },
     /// Acknowledgement of the processing completion
     Ack,
+    // After getting all acks, we send finalize Ack so that we stop broadcasting 
+    // prev msg, send this FinalizeAck to everyone so that they also stop 
+    // broadcasting
+    FinalizeAck
 }
 
 pub const SYS_READ_PROC_CMD_ID: u32 = 0;
 pub const SYS_VALUE_CMD_ID: u32 = 1;
 pub const SYS_WRITE_PROC_CMD_ID: u32 = 2;
 pub const SYS_ACK_CMD_ID: u32 = 3;
+pub const SYS_FINALIZE_ACK_CMD_ID: u32 = 4;
 
 impl SystemRegisterCommandContent
 {
-    pub fn get_size_in_bytes(&self) -> usize
-    {
-        return match self {
-            SystemRegisterCommandContent::ReadProc => {
-                std::mem::size_of_val(&SYS_READ_PROC_CMD_ID)
-            },
-            SystemRegisterCommandContent::Value { timestamp, write_rank, .. } => {
-                std::mem::size_of_val(&SYS_VALUE_CMD_ID)
-                + std::mem::size_of_val(timestamp)
-                + std::mem::size_of_val(write_rank)
-                + SECTOR_SIZE
-            },
-            SystemRegisterCommandContent::WriteProc { timestamp, write_rank, .. } => {
-                std::mem::size_of_val(&SYS_WRITE_PROC_CMD_ID)
-                + std::mem::size_of_val(timestamp)
-                + std::mem::size_of_val(write_rank)
-                + SECTOR_SIZE
-            },
-            SystemRegisterCommandContent::Ack => {
-                std::mem::size_of_val(&SYS_ACK_CMD_ID)
-            }
-        };
-    }
-
     pub fn encode(&self) -> Vec<u8>
     {
         let mut bytes: Vec<u8> = Vec::new();
@@ -219,6 +250,9 @@ impl SystemRegisterCommandContent
             },
             SystemRegisterCommandContent::Ack => {
                 bytes.extend_from_slice(&SYS_ACK_CMD_ID.to_be_bytes());
+            },
+            SystemRegisterCommandContent::FinalizeAck => {
+                bytes.extend_from_slice(&SYS_FINALIZE_ACK_CMD_ID.to_be_bytes());
             }
         }
         return bytes;
