@@ -291,7 +291,6 @@ async fn resend_all_msgs(
     }
 }
 
-
 fn try_recv_new_msgs(
     sector_sys_msg_map: &mut SectorSysMsgHashMap,
     rx: &mut UnboundedReceiver<Arc<SystemRegisterCommand>>

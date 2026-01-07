@@ -779,7 +779,7 @@ async fn concurrent_ops_on_the_same_sector_2_clients_5_processes() {
 #[timeout(30000)]
 async fn concurrent_operations_on_the_same_sector() 
 {
-    // init_logger();
+    init_logger();
     // given
     let port_range_start = 21519;
     let n_clients = 16;

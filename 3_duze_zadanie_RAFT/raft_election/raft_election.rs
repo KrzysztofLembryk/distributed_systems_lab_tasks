@@ -1,0 +1,499 @@
+use log::{info, debug};
+use module_system::{Handler, ModuleRef, System, TimerHandle};
+use std::collections::{HashSet};
+use tokio::time::Duration;
+use uuid::Uuid;
+
+// As always, do not invalidate the public interfaces and modify only explicitly marked areas.
+// You may add new derives and private methods as needed.
+const N_HEARTBEATS_DURING_TIMEOUT: u32 = 10;
+
+/// State of a Raft process.
+/// It shall be kept in stable storage, and updated before replying to messages.
+#[derive(Default, Clone, Copy, Debug)]
+pub(crate) struct ProcessState {
+    /// Number of the current term. `0` at boot.
+    pub(crate) current_term: u64,
+    /// Identifier of a process which has received this process' vote.
+    /// `None` if this process has not voted in this term.
+    voted_for: Option<Uuid>,
+    /// Identifier of a process which is thought to be the leader.
+    leader_id: Option<Uuid>,
+}
+
+/// Configuration of a Raft process.
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ProcessConfig {
+    /// UUID of the process.
+    pub(crate) self_id: Uuid,
+    /// Timeout used by this process.
+    /// In contrast to real-world applications, in this assignment,
+    /// the timeout shall not be randomized!
+    pub(crate) election_timeout: Duration,
+    /// Number of processes in the system.
+    /// In the assignment, there is a constant number of processes.
+    pub(crate) processes_count: usize,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RaftMessage {
+    pub(crate) header: RaftMessageHeader,
+    pub(crate) content: RaftMessageContent,
+}
+
+#[derive(Clone)]
+struct Timeout;
+
+struct Init;
+
+/// Message disabling a process. Used for testing to simulate failures.
+pub(crate) struct Disable;
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
+pub(crate) struct RaftMessageHeader {
+    /// Term of the process which issues the message.
+    pub(crate) term: u64,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub(crate) enum RaftMessageContent {
+    Heartbeat {
+        /// Id of the process issuing the message, which claims to be the leader.
+        leader_id: Uuid,
+    },
+    HeartbeatResponse,
+    RequestVote {
+        /// Id of the process issuing the message, which is a candidate.
+        candidate_id: Uuid,
+    },
+    RequestVoteResponse {
+        /// Whether the vote was granted or not.
+        granted: bool,
+        /// Id of the process issuing the message, which grants (or not) the vote.
+        source: Uuid,
+    },
+}
+
+pub(crate) trait StableStorage: Send {
+    fn put(&mut self, state: &ProcessState);
+
+    fn get(&self) -> Option<ProcessState>;
+}
+
+#[async_trait::async_trait]
+pub(crate) trait Sender: Send + Sync {
+    async fn send(&self, target: &Uuid, msg: RaftMessage);
+
+    async fn broadcast(&self, msg: RaftMessage);
+}
+
+/// Process of Raft.
+pub struct Raft {
+    state: ProcessState,
+    config: ProcessConfig,
+    storage: Box<dyn StableStorage>,
+    sender: Box<dyn Sender>,
+    process_type: ProcessType,
+    timer_handle: Option<TimerHandle>,
+    enabled: bool,
+    self_ref: ModuleRef<Self>,
+}
+
+impl Raft {
+    pub(crate) async fn new(
+        system: &mut System,
+        config: ProcessConfig,
+        storage: Box<dyn StableStorage>,
+        sender: Box<dyn Sender>,
+    ) -> ModuleRef<Self> {
+        let state = storage.get().unwrap_or_default();
+
+        let self_ref = system
+            .register_module(|self_ref| Self {
+                state,
+                config,
+                storage,
+                sender,
+                process_type: Default::default(),
+                timer_handle: None,
+                enabled: true,
+                self_ref,
+            })
+            .await;
+        self_ref.send(Init).await;
+        self_ref
+    }
+
+    // -------------
+    // Some helper methods are already implemented to make sure they're correct.
+    // -------------
+
+    async fn reset_timer(&mut self, interval: Duration) {
+        if let Some(handle) = self.timer_handle.take() {
+            handle.stop().await;
+        }
+        self.timer_handle = Some(self.self_ref.request_tick(Timeout, interval).await);
+    }
+
+    /// Set the process's term to the higher number.
+    fn update_term(&mut self, new_term: u64) {
+        assert!(self.state.current_term < new_term);
+        self.state.current_term = new_term;
+        self.state.voted_for = None;
+        self.state.leader_id = None;
+        // No reliable state update called here, must be called separately.
+    }
+
+    /// Reliably save the state.
+    fn update_state(&mut self) {
+        self.storage.put(&self.state);
+    }
+
+    /// Common message processing.
+    fn check_for_higher_term(&mut self, msg: &RaftMessage) {
+        if msg.header.term > self.state.current_term {
+            self.update_term(msg.header.term);
+            self.process_type = ProcessType::Follower;
+        }
+    }
+
+    /// Broadcast heartbeat.
+    async fn broadcast_heartbeat(&mut self) {
+        self.sender
+            .broadcast(RaftMessage {
+                header: RaftMessageHeader {
+                    term: self.state.current_term,
+                },
+                content: RaftMessageContent::Heartbeat {
+                    leader_id: self.config.self_id,
+                },
+            })
+            .await;
+    }
+
+    // -------------
+    // Example implementation is given for the Heartbeat message
+    // -------------
+
+    /// Handle the received heartbeat.
+    async fn handle_heartbeat(&mut self, leader_id: Uuid, leader_term: u64) {
+        if leader_term >= self.state.current_term {
+            self.state.leader_id = Some(leader_id);
+            self.update_state();
+
+            // Update the volatile state:
+            match &mut self.process_type {
+                ProcessType::Follower => {
+                    self.reset_timer(self.config.election_timeout).await;
+                }
+                ProcessType::Candidate { .. } => {
+                    self.process_type = ProcessType::Follower;
+                    self.reset_timer(self.config.election_timeout).await;
+                }
+                ProcessType::Leader => {
+                    log::debug!("Ignore, heartbeat from self");
+                }
+            }
+        }
+
+        // Response is always sent, so information about the term is disseminated:
+        self.sender
+            .send(
+                &leader_id,
+                RaftMessage {
+                    header: RaftMessageHeader {
+                        term: self.state.current_term,
+                    },
+                    content: RaftMessageContent::HeartbeatResponse,
+                },
+            )
+            .await;
+    }
+
+    async fn handle_request_vote(
+        &mut self, 
+        candidate_id: Uuid, 
+        candidate_term: u64,
+    )
+    {
+        let resp_header = RaftMessageHeader {term: self.state.current_term};
+        let content: RaftMessageContent;
+
+        match &mut self.process_type 
+        {
+            ProcessType::Follower => {
+                if candidate_term < self.state.current_term
+                || self.state.voted_for.is_some()
+                {
+                    // If old process crashed, then came back to live, and 
+                    // even though it has an outdated term, it can initiate 
+                    // election, so we need to reject him
+                    // OR if in this term we have already voted for 
+                    // someone, thus we reject this request
+                    content = RaftMessageContent::RequestVoteResponse { 
+                            granted: false, 
+                            source: self.config.self_id 
+                    };
+                    // If we reject we do not reset_timer, since now we wait for
+                    // new leader heartbeat
+                }
+                else
+                {
+                    info!("Follower: '{}' votes for: '{}'", self.config.self_id, candidate_id);
+                    // If we haven't voted for anyone in this term yet 
+                    // AND header term is big enough we vote for this candidate
+                    self.state.voted_for = Some(candidate_id);
+                    self.update_state();
+                    content = RaftMessageContent::RequestVoteResponse { 
+                            granted: true, 
+                            source: self.config.self_id 
+                    };
+                    // We reset timer and wait for new leader hearbeat
+                    // So we basically give this candidate time to gather votes
+                    self.reset_timer(self.config.election_timeout).await;
+                }
+            }
+            ProcessType::Candidate { .. } => {
+                // from visualisation recommended in task description
+                // we can see that candidate rejects other candidates requests
+                content = RaftMessageContent::RequestVoteResponse { 
+                        granted: false, 
+                        source: self.config.self_id 
+                };
+            }
+            ProcessType::Leader => {
+                debug!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
+                RequestVoteResponse, leader ignores this msg, probably some process died and revived after leader sent heartbeats", 
+                self.config.self_id, self.state.current_term);
+                // If we are here this means current candidate doesn't have term
+                // greater than this leader, so we reject since leader has voted
+                // for himself when he became a leader
+                content = RaftMessageContent::RequestVoteResponse { 
+                    granted: false, 
+                    source: self.config.self_id 
+                };
+            }
+        };
+
+        self.sender.send(
+            &candidate_id, 
+            RaftMessage { 
+                header: resp_header,
+                content: content
+            }
+        ).await;
+        return;
+    }
+
+
+    async fn handle_request_vote_response(
+        &mut self, 
+        granted: bool, 
+        source: Uuid
+    )
+    {
+        match &mut self.process_type 
+        {
+            ProcessType::Follower => {
+                debug!("Follower: '{}' got RequestVoteResponse from: '{}' - ignoring it - probably this follower used to be a candidate but got msg from other candidate, and changed to its follower", 
+                self.config.self_id, source);
+            }
+            ProcessType::Candidate { votes_received } => {
+                if granted
+                {
+                    info!("Candidate: '{}' got vote from: '{}'", self.config.self_id, source);
+                    votes_received.insert(source);
+
+                    // When we get majority we immediately become leader, reset timer and start our  leadership by sending heartbeats
+                    if votes_received.len() > self.config.processes_count / 2
+                    {
+                        info!("Candidate: '{}' has become a LEADER", 
+                            self.config.self_id);
+
+                        self.process_type = ProcessType::Leader;
+                        self.state.leader_id = Some(self.config.self_id);
+                        self.update_state();
+                        self.broadcast_heartbeat().await;
+                        self.reset_timer(self.config.election_timeout / N_HEARTBEATS_DURING_TIMEOUT).await;
+                    }
+                }
+            }
+            ProcessType::Leader => {
+                debug!("handle_request_vote_response:: Process: '{}' that is a leader during term: '{}' got 
+                RequestVoteResponse, leader ignores this msg, probably leader got majority before receiving all votes", 
+                self.config.self_id, self.state.current_term);
+            }
+        };
+    }
+
+    async fn handle_heartbeat_response(
+        &mut self,
+        heartbeat_term: u64
+    )
+    {
+        match &mut self.process_type 
+        {
+            ProcessType::Follower => {
+                debug!("FOLLOWER got HeartBeatResponse - it probably used to be a LEADER and stopped being one before receiving all hearbeat responses, IGNORING this msg");
+            }
+            ProcessType::Candidate { .. } => {
+                debug!("CANDIDATE got HeartBeatResponse - it probably used to be a LEADER and stopped being one before receiving all hearbeat responses, IGNORING this msg");
+            }
+            ProcessType::Leader => {
+                if self.state.current_term < heartbeat_term
+                {
+                    info!("LEADER: '{}' updated his TERM ({}) to a new one ({})", self.config.self_id , self.state.current_term, heartbeat_term);
+                    // if the Leader's Heartbeat has an outdated term, this lets leader update its term
+                    self.state.current_term = heartbeat_term;
+                    self.update_state();
+                }
+            }
+        };
+    }
+
+}
+
+#[async_trait::async_trait]
+impl Handler<Init> for Raft {
+    async fn handle(&mut self, _msg: Init) {
+        if self.enabled {
+            self.reset_timer(self.config.election_timeout).await;
+        }
+    }
+}
+
+/// Handle timer timeout.
+#[async_trait::async_trait]
+impl Handler<Timeout> for Raft {
+    async fn handle(&mut self, _: Timeout) {
+        if self.enabled {
+            match &mut self.process_type {
+                ProcessType::Follower => {
+                    info!("Follower '{}' has become a Candidate", self.config.self_id);
+                    // If as a Follower we need to handle timeout, it means we
+                    // didn't get HeartBeat so we need to start election
+                    // Leader crashed and we didn't vote for anyone, so 
+                    // 1) We make ourselves a Candidate
+                    // 2) We vote for ourselves
+                    // 3) We increment our term number
+                    // 4) We start election by broadcasting RequestVote
+                    self.process_type = ProcessType::Candidate { 
+                        votes_received: HashSet::from(
+                            [self.config.self_id]
+                    )};
+
+                    self.state.current_term += 1;
+                    self.state.voted_for = Some(self.config.self_id);
+                    self.state.leader_id = None;
+                    self.update_state();
+
+
+                    self.sender.broadcast(RaftMessage { 
+                        header: RaftMessageHeader { 
+                            term: self.state.current_term 
+                        },
+                        content: RaftMessageContent::RequestVote { 
+                            candidate_id:  self.config.self_id
+                        }
+                    }).await;
+                },
+                ProcessType::Candidate { votes_received } => {
+                    // if at the end of timeout we are still Candidate this 
+                    // means that leader didn't send us any heartbeat, or it 
+                    // was too old, and that any other candidate didn't send us 
+                    // request to vote for them with big enough term.
+                    // Thus we check our votes and either we become leader or 
+                    // restart process
+                    if votes_received.len() > self.config.processes_count / 2
+                    {
+                        info!("Candidate '{}' has become a Leader during timeout", self.config.self_id);
+
+                        self.process_type = ProcessType::Leader;
+                        self.state.leader_id = Some(self.config.self_id);
+                        self.update_state();
+                        self.broadcast_heartbeat().await;
+                        self.reset_timer(self.config.election_timeout / N_HEARTBEATS_DURING_TIMEOUT).await;
+                    }
+                    else
+                    {
+                        // We didnt get enough votes thus we restart election
+                        // process
+                        self.process_type = ProcessType::Candidate { 
+                            votes_received: HashSet::from(
+                                [self.config.self_id]
+                        )};
+
+                        self.state.current_term += 1;
+                        self.state.leader_id = None;
+                        self.state.voted_for = Some(self.config.self_id);
+                        self.update_state();
+
+                        self.sender.broadcast(RaftMessage { 
+                            header: RaftMessageHeader { 
+                                term: self.state.current_term 
+                            },
+                            content: RaftMessageContent::RequestVote { 
+                                candidate_id:  self.config.self_id
+                            }
+                        }).await;
+                    }
+                }
+                ProcessType::Leader => {
+                    self.broadcast_heartbeat().await;
+                }
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<RaftMessage> for Raft {
+    async fn handle(&mut self, msg: RaftMessage) {
+        if self.enabled {
+            // Reset the term and become a follower if we're outdated:
+            self.check_for_higher_term(&msg);
+
+            // TODO message specific processing. Heartbeat is given as an example:
+            match (&mut self.process_type, msg.content) 
+            {
+                (_, RaftMessageContent::Heartbeat { leader_id }) 
+                => {
+                    self.handle_heartbeat(leader_id, msg.header.term).await;
+                },
+
+                (_, RaftMessageContent::RequestVote { candidate_id }) 
+                => {
+                    self.handle_request_vote(candidate_id, msg.header.term).await;
+                },
+
+                (_, RaftMessageContent::RequestVoteResponse { granted, source })
+                => {
+                    self.handle_request_vote_response(granted, source).await;
+                },
+
+                (_, RaftMessageContent::HeartbeatResponse) 
+                => {
+                    self.handle_heartbeat_response(msg.header.term).await;
+                },
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Handler<Disable> for Raft {
+    async fn handle(&mut self, _: Disable) {
+        self.enabled = false;
+    }
+}
+
+/// State of a Raft process with a corresponding (volatile) information.
+#[derive(Default)]
+enum ProcessType {
+    #[default]
+    Follower,
+    Candidate {
+        votes_received: HashSet<Uuid>,
+    },
+    Leader,
+}
