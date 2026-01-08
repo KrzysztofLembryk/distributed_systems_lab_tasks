@@ -213,10 +213,15 @@ pub enum RaftMessageContent {
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
-pub struct AppendEntriesArgs {
+pub struct AppendEntriesArgs 
+{
+    // index of log entry immediately preceding new ones
     pub prev_log_index: usize,
+    // term of prev_log_index entry 
     pub prev_log_term: u64,
+    // empty for heartbeat
     pub entries: Vec<LogEntry>,
+    // leader's commit index from VolatileState
     pub leader_commit: usize,
 }
 
@@ -248,9 +253,9 @@ pub enum LogEntryContent {
 #[derive(Clone, Eq, PartialEq, Debug)]
 pub struct AppendEntriesResponseArgs {
     pub success: bool,
-    /// The last log index that appears in the corresponding `AppendEntries` message, used
-    /// for updating nextIndex and matchIndex in case of success. Equal to
-    /// `prev_log_index + entries.len()` from the `AppendEntries` message.
+    /// The last log index that appears in the corresponding `AppendEntries` 
+    /// message, used for updating nextIndex and matchIndex in case of success. 
+    /// Equal to `prev_log_index + entries.len()` from the `AppendEntries` message.
     pub last_verified_log_index: usize,
 }
 
