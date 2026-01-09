@@ -51,6 +51,9 @@ pub struct VolatileState
     // increases monotically)
     pub last_applied: IndexT,
 
+    // So that we can redirect clients to current leader
+    pub leader_id: Option<ServerIdT>,
+
     // -----------------------------------------------------------------------------
     //      LEADER volatile state, it's ALWAYS REINITIALIZED after election
     // -----------------------------------------------------------------------------
@@ -83,6 +86,7 @@ impl VolatileState
         return VolatileState { 
             commit_index: 0, 
             last_applied: 0, 
+            leader_id: None,
             next_index, 
             match_index
         };

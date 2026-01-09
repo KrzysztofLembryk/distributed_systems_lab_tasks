@@ -136,7 +136,8 @@ impl Raft {
     }
 
     /// Set the process's term to the higher number.
-    fn update_term(&mut self, new_term: u64) {
+    fn update_term(&mut self, new_term: u64) 
+    {
         assert!(self.state.current_term < new_term);
         self.state.current_term = new_term;
         self.state.voted_for = None;
@@ -150,7 +151,8 @@ impl Raft {
     }
 
     /// Common message processing.
-    fn check_for_higher_term(&mut self, msg: &RaftMessage) {
+    fn check_for_higher_term(&mut self, msg: &RaftMessage) 
+    {
         if msg.header.term > self.state.current_term {
             self.update_term(msg.header.term);
             self.process_type = ProcessType::Follower;
@@ -176,7 +178,8 @@ impl Raft {
     // -------------
 
     /// Handle the received heartbeat.
-    async fn handle_heartbeat(&mut self, leader_id: Uuid, leader_term: u64) {
+    async fn handle_heartbeat(&mut self, leader_id: Uuid, leader_term: u64) 
+    {
         if leader_term >= self.state.current_term {
             self.state.leader_id = Some(leader_id);
             self.update_state();

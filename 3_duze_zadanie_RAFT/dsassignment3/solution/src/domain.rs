@@ -219,7 +219,7 @@ pub struct AppendEntriesArgs
     pub prev_log_index: usize,
     // term of prev_log_index entry 
     pub prev_log_term: u64,
-    // empty for heartbeat
+    // empty for heartbeat, new entries to append after prev_log_index
     pub entries: Vec<LogEntry>,
     // leader's commit index from VolatileState
     pub leader_commit: usize,
