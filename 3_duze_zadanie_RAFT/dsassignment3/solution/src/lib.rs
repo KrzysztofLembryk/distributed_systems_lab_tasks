@@ -3,6 +3,7 @@ use other_raft_structs::{ServerType, ServerState, PersistentState};
 use rand::distr::uniform::SampleRange;
 use tokio::time::Duration;
 use std::collections::HashMap;
+use log::{debug, warn};
 
 pub use domain::*;
 use crate::types_defs::{IndexT, ServerIdT, TermT};
@@ -33,8 +34,6 @@ pub struct Raft
     msg_sender: Box<dyn RaftSender>,
     election_timer_handle: Option<TimerHandle>,
     heartbeat_timer_handle: Option<TimerHandle>,
-    // used only by leader
-    successful_heartbeat_round_happened: bool,
     self_ref: ModuleRef<Self>,
 }
 
@@ -85,7 +84,6 @@ impl Raft {
                 msg_sender: message_sender,
                 election_timer_handle: None,
                 heartbeat_timer_handle: None,
-                successful_heartbeat_round_happened: false,
                 self_ref,
             })
             .await;
@@ -137,7 +135,6 @@ impl Raft {
         };
 
         let mut msgs: HashMap<ServerIdT, RaftMessage> = HashMap::new();
-        let append_entries_batch_size = self.config.append_entries_batch_size;
 
         for server_id in &self.config.servers
         {
@@ -147,66 +144,74 @@ impl Raft {
                 continue;
             }
 
-            let next_index = *self.state.volatile.next_index
-                .get(server_id)
-                .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.next_index map", server_id));
-            let match_index = *self.state.volatile.match_index
-                .get(server_id)
-                .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.match_index map", server_id));
-
-            let prev_log_index: IndexT = next_index
-                    .checked_sub(1)
-                    .expect("Raft::broadcast_append_entries:: when calculating prev_log_index, next_index.checked_sub(1) failed");
-            let prev_log_term: TermT = self.state.persistent.log
-                    .get(prev_log_index)
-                    .expect(
-                    &format!("Raft::broadcast_append_entries:: there is no log in state.persistent.log for prev_log_index: {}", prev_log_index))
-                    .term;
-
-            let mut entries: Vec<LogEntry> = Vec::new();
-
-            // - If next_index == match_index + 1 we know that all log entries from 
-            //  0 to match_index are replicated on server, so we want send to it 
-            //  all new entries starting from nex_index.
-            // - But if next_index == log.len() this means that there are no new 
-            //  entries, so we need to send empty entries vector
-            // When new leader is elected it appends a NoOp and sets next_index to 
-            // NoOp's index, so we go into if only when there is a new log entry to
-            // be sent, and after sending it match_indec == next_index, so we won't
-            // go into if, this solves problem when we have only Initial Config Log
-            if next_index == match_index + 1
-            && next_index < self.state.persistent.log.len() 
-            {
-                let mut n_entries_appended: usize = 0;
-
-                // we send as many log entries as we are allowed to 
-                for log_entry in &self.state.persistent.log[next_index..]
-                {
-                    if n_entries_appended >= append_entries_batch_size
-                    {
-                        break;
-                    }
-
-                    entries.push(log_entry.clone());
-                    n_entries_appended += 1;
-                }
-            }
-
-            let content = RaftMessageContent::AppendEntries(
-                AppendEntriesArgs { 
-                    prev_log_index, 
-                    prev_log_term, 
-                    entries, 
-                    leader_commit: self.state.volatile.commit_index
-                }
-            );
-
-            let append_entries_msg = RaftMessage {header: header.clone(), content};
+            let args = 
+                self.create_append_entries_args_for_given_server(server_id);
+            let append_entries_msg = RaftMessage {
+                header: header.clone(), 
+                content: RaftMessageContent::AppendEntries(args)
+            };
 
             msgs.insert(*server_id, append_entries_msg);
-
         }
         self.broadcast(msgs).await;
+    }
+
+    fn create_append_entries_args_for_given_server(
+        &self, 
+        server_id: &ServerIdT
+    ) -> AppendEntriesArgs
+    {
+        let next_index = *self.state.volatile.leader_state.next_index
+            .get(server_id)
+            .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.next_index map", server_id));
+        let match_index = *self.state.volatile.leader_state.match_index
+            .get(server_id)
+            .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.match_index map", server_id));
+
+        let prev_log_index: IndexT = next_index
+                .checked_sub(1)
+                .expect("Raft::broadcast_append_entries:: when calculating prev_log_index, next_index.checked_sub(1) failed");
+        let prev_log_term: TermT = self.state.persistent.log
+                .get(prev_log_index)
+                .expect(
+                &format!("Raft::broadcast_append_entries:: there is no log in state.persistent.log for prev_log_index: {}", prev_log_index))
+                .term;
+
+        let append_entries_batch_size = self.config.append_entries_batch_size;
+        let mut entries: Vec<LogEntry> = Vec::new();
+
+        // - If next_index == match_index + 1 we know that all log entries from 
+        //  0 to match_index are replicated on server, so we want send to it 
+        //  all new entries starting from nex_index.
+        // - But if next_index == log.len() this means that there are no new 
+        //  entries, so we need to send empty entries vector
+        // !! This next_index < self.state.persistent.log.len() check is VITAL !!
+        // When new leader is elected it appends a NoOp and sets next_index to 
+        // NoOp's index.
+        if next_index == match_index + 1
+        && next_index < self.state.persistent.log.len() 
+        {
+            let mut n_entries_appended: usize = 0;
+
+            // we send as many log entries as we are allowed to 
+            for log_entry in &self.state.persistent.log[next_index..]
+            {
+                if n_entries_appended >= append_entries_batch_size
+                {
+                    break;
+                }
+
+                entries.push(log_entry.clone());
+                n_entries_appended += 1;
+            }
+        }
+
+        return AppendEntriesArgs { 
+                prev_log_index, 
+                prev_log_term, 
+                entries, 
+                leader_commit: self.state.volatile.commit_index
+            };
     }
 
     async fn broadcast(&mut self, mut msgs: HashMap<ServerIdT, RaftMessage>)
@@ -234,7 +239,7 @@ impl Raft {
     /// Set the process's term to the higher number.
     async fn update_term(&mut self, new_term: u64) 
     {
-        assert!(self.state.persistent.current_term < new_term);
+        assert!(new_term > self.state.persistent.current_term);
         self.state.persistent.current_term = new_term;
         self.state.persistent.voted_for = None;
         self.state.volatile.leader_id = None;
@@ -250,9 +255,9 @@ impl Raft {
             // If we were a leader we now revert to Follower so we need to stop our
             // hearbeat timer, if we are not Leader stopping heartbeat_timer 
             // does nothing
+            self.role = ServerType::Follower;
             self.stop_heartbeat_timer().await;
             self.update_term(msg.header.term).await;
-            self.role = ServerType::Follower;
         }
     }
 
@@ -262,17 +267,17 @@ impl Raft {
         args: &AppendEntriesArgs, 
     ) -> RaftMessage
     {
+        let response_header = RaftMessageHeader {
+            source: self.config.self_id,
+            term: self.state.persistent.current_term
+        };
+
         // See domain.rs AppendEntriesResponseArgs struct
         let last_verified_log_index = args.prev_log_index + args.entries.len();
 
         let response_args = AppendEntriesResponseArgs {
             success,
             last_verified_log_index
-        };
-
-        let response_header = RaftMessageHeader {
-            source: self.config.self_id,
-            term: self.state.persistent.current_term
         };
 
         return RaftMessage {
@@ -282,7 +287,7 @@ impl Raft {
     }
 
     /// Function applies all LogEntryContent::Command from state.persistent.log 
-    /// to StateMachine, by incrementing last_applied 
+    /// to StateMachine, by incrementing last_applied index
     /// as long as last_applied < commit_index
     async fn apply_commited_cmds_to_state_machine(&mut self)
     {
@@ -337,7 +342,7 @@ impl Raft {
         {
             self.state.volatile.leader_id = Some(leader_id);
 
-            match self.role
+            match &self.role
             {
                 ServerType::Follower => {
                     self.reset_election_timer().await;
@@ -389,7 +394,11 @@ impl Raft {
                     let leader_commit_index: usize = args.leader_commit;
                     // In persistent state we always have at least one log, which is
                     // config log that we add when creating RAFT server
-                    let last_new_entry_idx: usize = self.state.persistent.log.len() - 1;
+                    let last_new_entry_idx: usize = 
+                        self.state.persistent.log
+                            .len()
+                            .checked_sub(1)
+                            .expect("Raft::handle_append_entries:: last_new_entry_idx = state.persistent.log.len - 1 returned error, it means that len was 0, this shouldn't happen");
 
                     self.state.volatile.commit_index = 
                         std::cmp::min(leader_commit_index, last_new_entry_idx);
@@ -417,10 +426,123 @@ impl Raft {
             // term we reply with false, and not reset election_timeout
             response_msg = self.create_append_entries_response_msg(false, args);
         }
-
         self.msg_sender.send(&leader_id, response_msg).await;
     }
 
+    async fn handle_append_entries_response(
+        &mut self, 
+        args: &AppendEntriesResponseArgs, 
+        header: &RaftMessageHeader
+    )
+    {
+        match self.role 
+        {
+            ServerType::Follower => {
+                debug!("FOLLOWER got AppendEntriesResponse - it probably used to be a LEADER and stopped being one before receiving all responses, IGNORING this msg");
+            },
+            ServerType::Candidate { .. } => {
+                debug!("CANDIDATE got AppendEntriesResponse - it probably used to be a LEADER and stopped being one before receiving all responses, IGNORING this msg");
+            },
+            ServerType::Leader => {
+                if !self.config.servers.contains(&header.source)
+                {
+                    warn!("Raft::handle_append_entries_response:: Leader got response from server: '{}' which is not present in config.servers, IGNORING", header.source);
+                }
+                else if self.config.self_id == header.source
+                {
+                    panic!("Raft::handle_append_entries_response:: Leader got response from server with source_id: '{}' which is LEADER's id,
+                    this should never happen, or sb is sending malicious msgs, we cannot operate further like that, PANIC", header.source);
+                }
+                else 
+                {
+                    // If we got AppendEntriesResponse and we are still a leader it
+                    // means that our AppendEntries msg was received by given server
+                    // and that it reset its timer, so we can add him to our set
+                    // that counts how many servers responded to our heartbeat.
+                    // Even if in current round of Heartbeats some server responds
+                    // several times, we count it ONLY ONCE.
+                    self.state.volatile
+                        .leader_state
+                        .responses_from_followers.insert(header.source);
+
+                    let response_header = RaftMessageHeader {
+                        source: self.config.self_id,
+                        term: self.state.persistent.current_term
+                    };
+                    let response_args: AppendEntriesArgs;
+
+                    if args.success
+                    {
+                        // We got SUCCESS - so we need to update matchIndex and also
+                        // nextIndex
+                        let match_index = 
+                            self.state.volatile.leader_state.match_index
+                                .get_mut(&header.source)
+                                .unwrap();
+                        // last_verified_log_index is prev_log_index + entries.len()
+                        // so it's an index of highest log entry replicated on this 
+                        // server, thus we set our match_index to it
+                        *match_index = args.last_verified_log_index;
+
+                        let next_index = 
+                            self.state.volatile.leader_state.next_index
+                                .get_mut(&header.source)
+                                .unwrap();
+                        // Since last_verified_log_index is highest index of entry
+                        // replicated on Follower server, next entry we want to send
+                        // to the server is last_verified_log_index + 1
+                        *next_index = args.last_verified_log_index + 1;
+
+                        response_args = self.    
+                            create_append_entries_args_for_given_server(
+                                &header.source
+                        );
+                        if response_args.entries.is_empty()
+                        {
+                            // If args.entries are empty, this means that 
+                            // next_index == state.persistent.log.len(), so there are
+                            // no new entries to send so we end here
+                            return;
+                        }
+                        // otherwise we have some entries to send, so we want to send
+                        // them immediately
+                    }
+                    else
+                    {
+                        // If response is not successful it means that we didn't
+                        // have a match at prev_log_index, thus we need to decrement
+                        // nextIdx for this server.
+                        let next_index = self.state.volatile.leader_state.next_index
+                                .get_mut(&header.source)
+                                .unwrap();
+                        *next_index = next_index
+                            .checked_sub(1)
+                            .expect("Raft::handle_append_entries_response:: Response was FALSE, and in next_index.checked_sub(1) we got error, next_index must've been 0.");
+
+                        // And we need to send next AppendEntries immediately.
+                        // FALSE response means that we as LEADER will have some log 
+                        // entries to send to a follower, and from task we know that 
+                        // if we have entries to send, we should send them 
+                        // immediately 
+                        response_args = self.create_append_entries_args_for_given_server(
+                            &header.source
+                        );
+                    }
+
+                    let response_content = 
+                        RaftMessageContent::AppendEntries(response_args);
+
+                    self.msg_sender.send(
+                        &header.source, 
+                        RaftMessage { 
+                            header: response_header, 
+                            content: response_content
+                        }
+                    ).await;
+                }
+            },
+        };
+    }
 }
 
 #[async_trait::async_trait]
@@ -446,8 +568,45 @@ impl Handler<HeartbeatTimeout> for Raft
 {
     async fn handle(&mut self, _: HeartbeatTimeout) 
     {
-        // If we are not leader we will ignore this msg
-        todo!("Implement Timeout handler");
+        match self.role
+        {
+            ServerType::Leader => {
+                // We include ourselves when checking for majority
+                let heartbeat_response_count = &mut self.state.volatile.leader_state
+                    .responses_from_followers;
+
+                heartbeat_response_count.insert(self.config.self_id);
+
+                if heartbeat_response_count.len() > self.config.servers.len() / 2
+                {
+                    // When leader has ElectionTimeout, if 
+                    // successful_heartbeat_round_happened is FALSE leader reverts to
+                    // Follower, if it isn't we set it to FALSE to prepare for next
+                    // ElectionTimeout
+                    self.state.volatile.leader_state.successful_heartbeat_round_happened = true;
+                }
+
+                // We clear responses we got before next Heartbeat round
+                heartbeat_response_count.clear();
+
+                // We send heartbeat to all servers
+                self.broadcast_append_entries().await;
+            },
+            _ => {
+                // If we are not a LEADER, this means we got an old Heartbeat, 
+                // HeartbeatTimeout should be already STOPPED, but we still have a 
+                // HeartbeatTimeout msg in our channel queue, so we ignore it. 
+                // We might go here when:
+                // 1) In check_for_higher_term new Heartbeat was sent before 
+                //  stopping HeartBeat timer or just after stopping it and then 
+                //  after handling current msg in channel queue we still 
+                //  have a HeartbeatTimeout msg - but we are a FOLLOWER
+                // 2) When Leader had an election timeout without successful 
+                //  Heartbeat round, so he reverted back to FOLLOWER - so he stopped
+                //  HeartbeatTimer - but while handling ElectionTimeout another 
+                //  HeartbeatTimeout was sent
+            }
+        }
     }
 }
 
@@ -468,7 +627,7 @@ impl Handler<RaftMessage> for Raft
                 self.handle_append_entries(&args, header).await;
             },
             RaftMessageContent::AppendEntriesResponse(response_args) => {
-
+                self.handle_append_entries_response(&response_args, header).await;
             },
             RaftMessageContent::RequestVote(args) => {
 
