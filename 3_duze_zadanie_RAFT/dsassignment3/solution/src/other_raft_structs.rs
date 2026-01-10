@@ -1,4 +1,5 @@
 use serde::{Serialize, Deserialize};
+use tokio::time::Instant;
 use std::{collections::{HashSet, HashMap}};
 use uuid::Uuid;
 
@@ -54,6 +55,12 @@ pub struct VolatileState
     // So that we can redirect clients to current leader
     pub leader_id: Option<ServerIdT>,
 
+    // So that we can reject RequestVote received within the minimum election timeout
+    // meaning request that arrived right after we got Leader's heartbeat, so we want
+    // to wait Minimal election timeout from election_timeout_range before accepting
+    // VoteRequests
+    pub last_hearing_from_leader_timer: Option<Instant>,
+
     // -----------------------------------------------------------------------------
     //      LEADER volatile state, it's ALWAYS REINITIALIZED after election
     // -----------------------------------------------------------------------------
@@ -70,6 +77,7 @@ impl VolatileState
             commit_index: 0, 
             last_applied: 0, 
             leader_id: None,
+            last_hearing_from_leader_timer: None,
             leader_state: VolatileLeaderState::new(server_ids) 
         };
     }
@@ -112,6 +120,24 @@ impl VolatileLeaderState
             next_index, 
             match_index 
         };
+    }
+
+    pub fn reinitialize(&mut self, 
+        server_ids: &HashSet<ServerIdT>,
+        last_log_index: IndexT
+    )
+    {
+        self.successful_heartbeat_round_happened = false;
+        self.responses_from_followers.clear(); 
+
+        self.next_index.clear();
+        self.match_index.clear();
+
+        for server_id in server_ids
+        {
+            self.next_index.insert(*server_id, last_log_index + 1);
+            self.match_index.insert(*server_id, 0);
+        }
     }
 }
 

@@ -3,7 +3,7 @@ use other_raft_structs::{ServerType, ServerState, PersistentState};
 use rand::distr::uniform::SampleRange;
 use tokio::time::Duration;
 use std::collections::HashMap;
-use log::{debug, warn};
+use log::{debug, warn, info};
 
 pub use domain::*;
 use crate::types_defs::{IndexT, ServerIdT, TermT};
@@ -55,7 +55,6 @@ impl Raft {
             stable_storage.get(&config.self_id.to_string()).await
         {
             persistent_state = decode_from_slice(&retrieved_state).unwrap();
-
             recover_state_machine(&persistent_state, &mut state_machine).await;
         }
         else
@@ -91,6 +90,11 @@ impl Raft {
         self_ref.send(Init).await;
 
         return self_ref;
+    }
+
+    fn get_minimal_election_timeout(&self) -> &Duration
+    {
+        return self.config.election_timeout_range.start();
     }
 
     async fn stop_heartbeat_timer(&mut self)
@@ -248,16 +252,16 @@ impl Raft {
         self.save_to_stable_storage().await;
     }
 
-    async fn check_for_higher_term(&mut self, msg: &RaftMessage) 
+    async fn check_for_higher_term(&mut self, new_term: u64) 
     {
-        if msg.header.term > self.state.persistent.current_term 
+        if new_term > self.state.persistent.current_term 
         {
             // If we were a leader we now revert to Follower so we need to stop our
             // hearbeat timer, if we are not Leader stopping heartbeat_timer 
             // does nothing
             self.role = ServerType::Follower;
             self.stop_heartbeat_timer().await;
-            self.update_term(msg.header.term).await;
+            self.update_term(new_term).await;
         }
     }
 
@@ -341,6 +345,10 @@ impl Raft {
         if leader_term >= self.state.persistent.current_term
         {
             self.state.volatile.leader_id = Some(leader_id);
+
+            // Since we got msg from Leader, we reset our last_hearing_timer
+            self.state.volatile.last_hearing_from_leader_timer = 
+                Some(tokio::time::Instant::now());
 
             match &self.role
             {
@@ -543,6 +551,206 @@ impl Raft {
             },
         };
     }
+
+    async fn handle_request_vote(
+        &mut self, 
+        args: &RequestVoteArgs, 
+        header: &RaftMessageHeader
+    )
+    {
+        let candidate_term = header.term;
+        let candidate_id = header.source;
+
+        let response_header = RaftMessageHeader {
+            source: self.config.self_id,
+            term: self.state.persistent.current_term
+        };
+        let response_args: RequestVoteResponseArgs;
+
+        match self.role 
+        {
+            ServerType::Follower => {
+                if candidate_term < self.state.persistent.current_term
+                || self.state.persistent.voted_for.is_some()
+                {
+                    // If old process crashed, then came back to live, and 
+                    // even though it has an outdated term, it can initiate 
+                    // election, so we need to reject him
+                    // OR if in this term we have already voted for 
+                    // someone, we reject this request
+                    response_args = RequestVoteResponseArgs { 
+                        vote_granted: false
+                    };
+                    // If we reject we do not reset_timer, since now we still wait 
+                    // for new leader heartbeat
+                }
+                else
+                {
+                    // We haven't voted for anyone yet and candidate_term is big 
+                    // enough, but to vote for this candidate we must also check if 
+                    // his LOG is up-to-date.
+                    // --> We will do that by comparing the index and term of the
+                    // last entries in the logs. 
+                    //      1) If the logs have last entries with different terms, 
+                    //      then the log with the bigger term is more up-to-date
+                    //      2) If logs end with the same term, then whichever log is
+                    //      longer is more up-to-date
+                    // If candidate log is more up-to-date than ours we VOTE FOR HIM
+                    let my_last_log_idx = self.state.persistent.log
+                        .len()
+                        .checked_sub(1)
+                        .unwrap(); 
+                    let my_last_log_entry_term = self.state.persistent.log
+                        .get(my_last_log_idx)
+                        .unwrap()
+                        .term;
+                    let vote_granted: bool;
+
+                    if my_last_log_entry_term == args.last_log_term
+                    {
+                        if my_last_log_idx <= args.last_log_index
+                        {
+                            vote_granted = true;
+                        }
+                        else
+                        {
+                            vote_granted = false;
+                        }
+                    }
+                    else if my_last_log_entry_term < args.last_log_term
+                    {
+                        vote_granted = true;
+                    }
+                    else // my_last_log_entry_term > args.last_log_term
+                    {
+                        vote_granted = false;
+                    }
+
+                    if vote_granted
+                    {
+                        info!("Follower: '{}' votes for: '{}'", self.config.self_id, candidate_id);
+                        self.state.persistent.voted_for = Some(candidate_id);
+                        self.save_to_stable_storage().await;
+                    }
+
+                    response_args = RequestVoteResponseArgs { vote_granted };
+
+                    // We do not reset last_hearing_timer since this msg is from 
+                    // Candidate not from Leader
+                    // We reset ElectionTimer to give this candidate time to gather 
+                    // votes
+                    self.reset_election_timer().await;
+                }
+            }
+            ServerType::Candidate { .. } => {
+                // From visualisation recommended in previous RAFT task description
+                // we can see that candidate rejects other candidates requests
+                response_args = RequestVoteResponseArgs { 
+                    vote_granted: false
+                };
+            }
+            ServerType::Leader => {
+                // If everything works correctly we should never get here since 
+                // Leader always ignores RequestVote
+                panic!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
+                RequestVoteResponse from: '{}', leader should ALWAYS IGNORE any RequestVote", self.config.self_id, self.state.persistent.current_term, header.source);
+            }
+        };
+
+        self.msg_sender.send(&candidate_id, RaftMessage { 
+            header: response_header, 
+            content: RaftMessageContent::RequestVoteResponse(response_args)
+        }).await;
+    }
+
+    async fn handle_request_vote_with_last_hearing_timer(
+        &mut self, 
+        header: &RaftMessageHeader,
+        args: &RequestVoteArgs
+    )
+    {
+        if let Some(last_hearing_timer) = &self.state.volatile
+                                        .last_hearing_from_leader_timer
+        {
+            let min_election_timeout = self.get_minimal_election_timeout();
+
+            if last_hearing_timer.elapsed() >= *min_election_timeout
+            {
+                // We haven't received Heartbeat from Leader during minimal
+                // election timeout thus we can respond to RequestVote
+                self.check_for_higher_term(header.term).await;
+                self.handle_request_vote(args, header).await;
+            }
+            else
+            {
+                // Not enough time since last Leader's heartbeat has elapsed
+                // for us to respond to RequestVote, 
+                // so we IGNORE IT and DON'T UPDATE OUR TERM etc.
+                debug!("Server: '{}' got RequestVote from: '{}', but minimal election timeout from hearing heartbeat from leader hasn't passed, thus IGNORING this msg", self.config.self_id, header.source);
+            }
+        }
+        else
+        {
+            // We don't have timer, thus we are not waiting for any leader
+            // heartbeat or WE ARE LEADER
+            match self.role
+            {
+                ServerType::Leader => {
+                    // Leader ALWAYS ignores RequestVote
+                    debug!("Leader: '{}' got RequestVote - IGNORING it", self.config.self_id);
+                }
+                _ => {
+                    // Anyone else proceeds
+                    self.check_for_higher_term(header.term).await;
+                    self.handle_request_vote(args, header).await;
+                }
+            }
+        }
+    }
+
+    async fn handle_request_vote_response(
+        &mut self, 
+        header: &RaftMessageHeader,
+        args: &RequestVoteResponseArgs
+    )
+    {
+        match &mut self.role 
+        {
+            ServerType::Follower => {
+                debug!("Follower: '{}' got RequestVoteResponse from: '{}' - IGNORING it - probably this follower used to be a candidate but got msg from  Leader, and changed to its follower", 
+                self.config.self_id, header.source);
+            },
+            ServerType::Candidate { votes_received } => {
+                if args.vote_granted
+                {
+                    info!("Candidate: '{}' got vote from: '{}'", self.config.self_id, header.source);
+
+                    votes_received.insert(header.source);
+
+                    // When we get majority we immediately become leader, reset timer and start our  leadership by sending heartbeats
+                    if votes_received.len() > self.config.servers.len() / 2
+                    {
+                        info!("Candidate: '{}' has become a LEADER", 
+                            self.config.self_id);
+
+                        self.role = ServerType::Leader;
+                        self.state.volatile.leader_id = Some(self.config.self_id);
+                        self.state.volatile.leader_state.reinitialize(
+                            &self.config.servers, 
+                            self.state.persistent.log.len().checked_sub(1).unwrap() 
+                        );
+
+                        self.broadcast_append_entries().await;
+                        self.reset_election_timer().await;
+                    }
+                }
+            },
+            ServerType::Leader => {
+                debug!("Leader: '{}' during term: '{}' got RequestVoteResponse, leader ignores this msg, probably leader got majority before receiving all votes", 
+                self.config.self_id, self.state.persistent.current_term);
+            },
+        };
+    }
 }
 
 #[async_trait::async_trait]
@@ -615,25 +823,25 @@ impl Handler<RaftMessage> for Raft
 {
     async fn handle(&mut self, msg: RaftMessage) 
     {
-        // Reset the term and become a follower if we're outdated:
-        // Probably we need to change that to accommodate new changes
-        self.check_for_higher_term(&msg).await;
-
         let header = &msg.header;
 
-        match msg.content
+        match &msg.content
         {
             RaftMessageContent::AppendEntries(args) => {
+                // Reset the term and become a follower if we're outdated:
+                self.check_for_higher_term(header.term).await;
                 self.handle_append_entries(&args, header).await;
             },
             RaftMessageContent::AppendEntriesResponse(response_args) => {
+                self.check_for_higher_term(header.term).await;
                 self.handle_append_entries_response(&response_args, header).await;
             },
             RaftMessageContent::RequestVote(args) => {
-
+                self.handle_request_vote_with_last_hearing_timer(header, args).await;
             },
             RaftMessageContent::RequestVoteResponse(response_args) => {
-
+                self.check_for_higher_term(header.term).await;
+                self.handle_request_vote_response(header, response_args).await;
             },
             RaftMessageContent::InstallSnapshot(args) => {
 
