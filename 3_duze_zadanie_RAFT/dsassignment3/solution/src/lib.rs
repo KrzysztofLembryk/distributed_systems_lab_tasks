@@ -1,7 +1,7 @@
 use module_system::{Handler, ModuleRef, System, TimerHandle};
 use other_raft_structs::{ServerType, ServerState, PersistentState};
 use rand::distr::uniform::SampleRange;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use std::collections::{HashMap, HashSet};
 use log::{debug, warn, info};
 
@@ -798,6 +798,16 @@ impl Raft {
                             self.config.self_id);
 
                         self.role = ServerType::Leader;
+
+                        // When a server becomes a leader, it must append a NoOp entry to the log (nextIndex must be initialized with the index of this entry).
+                        self.state.persistent.log.push(LogEntry {
+                            content: LogEntryContent::NoOp,
+                            term: self.state.persistent.current_term,
+                            timestamp: Instant::now()
+                                        .duration_since(self.config.system_boot_time)
+                        });
+                        self.save_to_stable_storage().await;
+
                         self.state.volatile.leader_id = Some(self.config.self_id);
                         self.state.volatile.leader_state.reinitialize(
                             &self.config.servers, 
@@ -994,7 +1004,14 @@ impl Handler<ClientRequest> for Raft
 {
     async fn handle(&mut self, msg: ClientRequest) 
     {
-        todo!()
+        match self.role
+        {
+            ServerType::Follower => {
+                let response = ClientRequestResponse {
+
+                }
+            }
+        }
     }
 }
 

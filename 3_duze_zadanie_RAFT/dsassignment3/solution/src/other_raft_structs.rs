@@ -135,7 +135,7 @@ impl VolatileLeaderState
 
         for server_id in server_ids
         {
-            self.next_index.insert(*server_id, last_log_index + 1);
+            self.next_index.insert(*server_id, last_log_index);
             self.match_index.insert(*server_id, 0);
         }
     }
