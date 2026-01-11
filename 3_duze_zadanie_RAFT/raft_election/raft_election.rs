@@ -390,7 +390,6 @@ impl Handler<Timeout> for Raft {
                     self.state.leader_id = None;
                     self.update_state();
 
-
                     self.sender.broadcast(RaftMessage { 
                         header: RaftMessageHeader { 
                             term: self.state.current_term 

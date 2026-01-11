@@ -2,7 +2,7 @@ use module_system::{Handler, ModuleRef, System, TimerHandle};
 use other_raft_structs::{ServerType, ServerState, PersistentState};
 use rand::distr::uniform::SampleRange;
 use tokio::time::Duration;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use log::{debug, warn, info};
 
 pub use domain::*;
@@ -131,6 +131,43 @@ impl Raft {
             Some(self.self_ref.request_tick(ElectionTimeout, rand_election_timeout).await);
     }
 
+    async fn broadcast_request_vote(&mut self)
+    {
+        let header = RaftMessageHeader {
+            source: self.config.self_id,
+            term: self.state.persistent.current_term
+        };
+
+        let last_log_index = 
+            self.state.persistent.log.len().checked_sub(1).unwrap();
+        let last_log_term = 
+            self.state.persistent.log.get(last_log_index).unwrap().term;
+
+        let args = RequestVoteArgs {
+            last_log_index,
+            last_log_term
+        };
+
+        let mut msgs: HashMap<ServerIdT, RaftMessage> = HashMap::new();
+
+        let request_vote_msg = RaftMessage { 
+            header, 
+            content: RaftMessageContent::RequestVote(args)
+        };
+
+        for server_id in &self.config.servers
+        {
+            // We don't want to send msgs to ourselves
+            if *server_id == self.config.self_id
+            {
+                continue;
+            }
+            msgs.insert(*server_id, request_vote_msg.clone());
+        }
+
+        self.broadcast(&mut msgs).await;
+    }
+
     async fn broadcast_append_entries(&mut self) 
     {
         let header = RaftMessageHeader {
@@ -157,7 +194,7 @@ impl Raft {
 
             msgs.insert(*server_id, append_entries_msg);
         }
-        self.broadcast(msgs).await;
+        self.broadcast(&mut msgs).await;
     }
 
     fn create_append_entries_args_for_given_server(
@@ -218,7 +255,7 @@ impl Raft {
             };
     }
 
-    async fn broadcast(&mut self, mut msgs: HashMap<ServerIdT, RaftMessage>)
+    async fn broadcast(&mut self, msgs: &mut HashMap<ServerIdT, RaftMessage>)
     {
         for server_id in &self.config.servers
         {
@@ -288,6 +325,33 @@ impl Raft {
             header: response_header,
             content: RaftMessageContent::AppendEntriesResponse(response_args)
         };
+    }
+
+    fn update_commit_index_if_leader(&mut self)
+    {
+        match self.role
+        {
+            ServerType::Leader => {
+                // We need to insert ourselves so that we can easily check if we 
+                // need to update commitIndex. 
+                let mut match_indexes = self.state.volatile.leader_state.match_index.clone();
+                match_indexes.insert(
+                    self.config.self_id, 
+                    self.state.persistent.log.len() - 1
+                );
+
+                // If there is no new commit_index it returns old one
+                let commit_index = find_new_commit_index(
+                    self.state.volatile.commit_index, 
+                    &match_indexes,
+                    &self.state.persistent.log,
+                    self.state.persistent.current_term
+                );
+
+                self.state.volatile.commit_index = commit_index;
+            },
+            _ => {return;}
+        }
     }
 
     /// Function applies all LogEntryContent::Command from state.persistent.log 
@@ -365,7 +429,7 @@ impl Raft {
                     // Before handling any msg we do check_for_higher_term(), so if 
                     // we have old term, we revert to FOLLOWER, Leader does not send 
                     // msgs to itself and from RAFT we know that there is only one 
-                    // leader for given term a time, thus this branch should be 
+                    // leader for given term at a time, thus this branch should be 
                     // NEVER invoked
                     panic!("Raft::handle_append_entries:: Server which is Leader handles AppendEntries msg, this should never happen, source: {}, term: {}", header.source, header.term);
                 }
@@ -641,20 +705,20 @@ impl Raft {
                     // votes
                     self.reset_election_timer().await;
                 }
-            }
+            },
             ServerType::Candidate { .. } => {
                 // From visualisation recommended in previous RAFT task description
                 // we can see that candidate rejects other candidates requests
                 response_args = RequestVoteResponseArgs { 
                     vote_granted: false
                 };
-            }
+            },
             ServerType::Leader => {
                 // If everything works correctly we should never get here since 
                 // Leader always ignores RequestVote
                 panic!("handle_request_vote:: Process: '{}' that is a leader during term: '{}' got 
                 RequestVoteResponse from: '{}', leader should ALWAYS IGNORE any RequestVote", self.config.self_id, self.state.persistent.current_term, header.source);
-            }
+            },
         };
 
         self.msg_sender.send(&candidate_id, RaftMessage { 
@@ -692,7 +756,7 @@ impl Raft {
         else
         {
             // We don't have timer, thus we are not waiting for any leader
-            // heartbeat or WE ARE LEADER
+            // heartbeat as Follower, we are Candidate or WE ARE LEADER
             match self.role
             {
                 ServerType::Leader => {
@@ -739,8 +803,8 @@ impl Raft {
                             &self.config.servers, 
                             self.state.persistent.log.len().checked_sub(1).unwrap() 
                         );
-
                         self.broadcast_append_entries().await;
+                        self.reset_heartbeat_timer().await;
                         self.reset_election_timer().await;
                     }
                 }
@@ -767,7 +831,71 @@ impl Handler<ElectionTimeout> for Raft
 {
     async fn handle(&mut self, _: ElectionTimeout) 
     {
-        todo!("Implement Timeout handler");
+        match self.role
+        {
+            ServerType::Follower => {
+                info!("Follower '{}' has become a Candidate", self.config.self_id);
+
+                self.role = ServerType::Candidate { 
+                    votes_received: HashSet::from(
+                        [self.config.self_id]
+                )};
+
+                self.state.persistent.current_term += 1;
+                self.state.persistent.voted_for = Some(self.config.self_id);
+
+                self.state.volatile.leader_id = None;
+                self.state.volatile.last_hearing_from_leader_timer = None;
+                
+                self.save_to_stable_storage().await;
+                self.reset_election_timer().await;
+                self.broadcast_request_vote().await;
+            },
+            ServerType::Candidate { .. } => {
+                // If we are a Candidate and has election timeout, this means that
+                // we didn't get enough votes to become Leader, cause if we had 
+                // enough votes, in RequestVoteResponse handler we would become 
+                // Leader thus we restart election
+
+                self.role = ServerType::Candidate { 
+                    votes_received: HashSet::from(
+                        [self.config.self_id]
+                )};
+
+                self.state.persistent.current_term += 1;
+                self.state.persistent.voted_for = Some(self.config.self_id);
+                self.state.volatile.leader_id = None;
+                // Setting last_hearing to None is not necessary here, but just to 
+                // be sure I set it.
+                self.state.volatile.last_hearing_from_leader_timer = None;
+                self.save_to_stable_storage().await;
+
+                self.reset_election_timer().await;
+                self.broadcast_request_vote().await;
+            },
+            ServerType::Leader => {
+                if self.state.volatile
+                    .leader_state.successful_heartbeat_round_happened
+                {
+                    // We had a successful heartbeat round so we stay as Leader
+                    self.state.volatile
+                        .leader_state
+                        .successful_heartbeat_round_happened = false;
+                    self.state.volatile
+                        .leader_state
+                        .responses_from_followers.clear();
+                }
+                else
+                {
+                    // We didn't have successful heartbeat round during whole 
+                    // election timeout thus we revert back to Follower
+                    self.role = ServerType::Follower;
+                    self.state.volatile.leader_id = None;
+                    self.stop_heartbeat_timer().await;
+                    self.reset_election_timer().await;
+                }
+            }
+        }
     }
 }
 
@@ -851,6 +979,9 @@ impl Handler<RaftMessage> for Raft
             }
         }
 
+        // TODO: change commit_index if role is LEADER
+        self.update_commit_index_if_leader();
+
         // After handling given msg and responding, if there are log entries to apply
         // and we haven't applied them yet we do it now, but only if we know they are
         // COMMITTED
@@ -888,4 +1019,81 @@ async fn recover_state_machine(
             }
         }
     }
+}
+
+fn find_new_commit_index(
+    mut commit_index: usize, 
+    match_indexes: &HashMap<ServerIdT, IndexT>,
+    log_entries: &Vec<LogEntry>,
+    current_term: TermT
+) -> usize
+{
+    // matchIndex is index of highest log entry known to be replicated on server.
+    // We want only to preserve information about values, no server ids
+    let mut match_indexes: Vec<IndexT> = match_indexes.iter().map(|(_,v)| *v).collect();
+    // Sorts in ascending order
+    match_indexes.sort();
+
+    let nbr_of_all_indexes = match_indexes.len();
+    let mut n_prev_biggest_indexes: usize = 0;
+
+    // Algorithm:
+    // 1) We remove currBiggestIndex that is > commitIndex 
+    // 2) We check if majority of matchIndexes is >= currBiggestIndex
+    // 3) If not we add it to prev_biggest_indexes
+    // 4) We take another currBiggestIndex > commitIndex, 
+    //  check if majority (we include indexes from prev_biggest_indexes) of 
+    //  matchIndexes >= currBiggestIndex 
+    // 5) If yes we set our commitIndex to this currBiggestIndex and end
+    // 6) If not we repeat till there is no index > commitIndex
+    while !match_indexes.is_empty()
+    {
+        let curr_biggest = match_indexes.remove(match_indexes.len() - 1);
+
+        if curr_biggest <= commit_index
+        {
+            break;
+        }
+
+        // We also need to count curr_biggest index since it is geq than itself
+        let mut n_idexes_geq: usize = 1;
+
+        for val in match_indexes.iter().rev()
+        {
+            if *val >= curr_biggest
+            {
+                n_idexes_geq += 1;
+            }
+            else
+            {
+                // vector is sorted increasingly, so if we encounter first point
+                // at which val < curr_biggest, all next vals also will be smaller
+                break;
+            }
+        }
+
+        if n_idexes_geq + n_prev_biggest_indexes > nbr_of_all_indexes / 2
+        {
+            if let Some(log) = log_entries.get(curr_biggest)
+            {
+                if log.term == current_term
+                {
+                    commit_index = curr_biggest;
+                    break;
+                }
+                // otherwise we continue searching for commit_index, so we need to
+                // add this one to prev_biggest
+                n_prev_biggest_indexes += 1;
+            }
+            else
+            {
+                panic!("fine_new_commit_index:: there is no log_entry in Leader's log_entries for curr_biggest index: '{}', log_entries.len() = {}", curr_biggest, log_entries.len());
+            }
+        }
+        else
+        {
+            n_prev_biggest_indexes += 1;
+        }
+    }
+    return commit_index;
 }
