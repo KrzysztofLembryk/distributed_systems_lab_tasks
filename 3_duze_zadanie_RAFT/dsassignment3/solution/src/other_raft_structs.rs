@@ -95,7 +95,8 @@ pub struct VolatileLeaderState
     // (initialized to 0, increases monotically)
     pub match_index: HashMap<ServerIdT, IndexT>,
 
-    pub client_session: HashMap<ClientIdT, ClientSessionData>
+    pub client_session: HashMap<ClientIdT, ClientSessionData>,
+    pub cmd_idx_to_client_id: HashMap<IndexT, ClientIdT>,
 }
 
 impl VolatileLeaderState
@@ -122,7 +123,8 @@ impl VolatileLeaderState
             responses_from_followers, 
             next_index, 
             match_index,
-            client_session: HashMap::new()
+            client_session: HashMap::new(),
+            cmd_idx_to_client_id: HashMap::new(),
         };
     }
 
@@ -144,14 +146,40 @@ impl VolatileLeaderState
         }
     }
 
-    pub fn insert_
+    pub fn insert_new_pending_cmd(
+        &mut self,
+        client_id: ClientIdT,
+        command_index: IndexT,
+        reply_to: UnboundedSender<ClientRequestResponse>,
+        request_info: ClientRequestInfo
+    )
+    {
+        self.cmd_idx_to_client_id.insert(command_index, client_id);
+
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            c_session.reply_to = reply_to;
+            c_session.pending_cmds.insert(command_index, request_info);
+        }
+        else
+        {
+            self.client_session.insert(client_id, ClientSessionData { 
+                reply_to, 
+                executed_cmds: HashMap::new(), 
+                pending_cmds: HashMap::from([(command_index, request_info)])
+            });
+        }
+    }
 }
 
 pub struct ClientSessionData
 {
     pub reply_to: UnboundedSender<ClientRequestResponse>,
+    // we store only ClientRequest::Command responses, since only they change 
+    // StateMachine
     pub executed_cmds: HashMap<SequenceNumT, (IndexT, ClientRequestInfo)>,
-    pub pending_cmds: HashMap<IndexT, SequenceNumT>,
+    // Pending commands may be different
+    pub pending_cmds: HashMap<IndexT, ClientRequestInfo>,
 }
 
 pub enum ClientRequestInfo {
@@ -162,6 +190,8 @@ pub enum ClientRequestInfo {
         sequence_num: u64,
         lowest_sequence_num_without_response: u64,
     },
+    // Only info that we had command
+    CommandPlaceholder,
     /// Create a snapshot of the current state of the state machine.
     Snapshot,
     /// Add a server to the cluster.

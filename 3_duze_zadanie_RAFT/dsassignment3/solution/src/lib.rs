@@ -2,6 +2,7 @@ use module_system::{Handler, ModuleRef, System, TimerHandle};
 use other_raft_structs::{ServerType, ServerState, PersistentState};
 use rand::distr::uniform::SampleRange;
 use tokio::time::{Duration, Instant};
+use uuid::Uuid;
 use std::collections::{HashMap, HashSet};
 use log::{debug, warn, info};
 
@@ -392,8 +393,20 @@ impl Raft {
             {
                 match &log_entry.content
                 {
-                    LogEntryContent::Command { data, .. } => {
-                        self.state_machine.apply(data).await;
+                    // TODO: 1) complete handling this case, we should remove command
+                    // index from leader_state.cmd_idx_to_client_id
+                    // and move from c_session.pending_cmds to executed_cmds
+                    // than reply to Client
+                    // 2) In cmd_idx_to_client_id we should store EITHER client_id
+                    // or reply_to since SNAPSHOT doesn't have client Id
+                    LogEntryContent::Command { 
+                        data, 
+                        client_id, 
+                        sequence_num, 
+                        lowest_sequence_num_without_response
+                    } => {
+                        let result = self.state_machine.apply(data).await;
+                        self.state.volatile.leader_state.
                     },
                     // We skip all logs apart from Command logs, since only these 
                     // we want to apply to our StateMachine - I think
@@ -1054,14 +1067,13 @@ impl Handler<ClientRequest> for Raft
                         self.save_to_stable_storage().await;
 
                         let command_index = self.state.persistent.log.len() - 1;
+
                         self.state.volatile
-                            .leader_state.client_session.insert(
+                            .leader_state.insert_new_pending_cmd(
+                                client_id,
                                 command_index,
-                                ClientRequestInfo { 
-                                    log_index: command_index, 
-                                    reply_to: msg.reply_to, 
-                                    client_request_cmd: ClientRequestInfo::Command
-                                }
+                                msg.reply_to,
+                                ClientRequestInfo::CommandPlaceholder 
                             );
 
                         // After appending new log entry we broadcast it to all other
@@ -1078,6 +1090,7 @@ impl Handler<ClientRequest> for Raft
                         unimplemented!("Handler<ClientRequest>:: Leader - RemoveServer unimplemented");
                     },
                     ClientRequestContent::RegisterClient => {
+                        let client_id = Uuid::new_v4();
                         let log_content = LogEntryContent::RegisterClient; 
 
                         let log_entry = LogEntry {
@@ -1091,13 +1104,11 @@ impl Handler<ClientRequest> for Raft
 
                         let command_index = self.state.persistent.log.len() - 1;
                         self.state.volatile
-                            .leader_state.client_session.insert(
+                            .leader_state.insert_new_pending_cmd(
+                                client_id,
                                 command_index,
-                                ClientRequestInfo { 
-                                    log_index: command_index, 
-                                    reply_to: msg.reply_to, 
-                                    client_request_cmd: ClientRequestInfo::RegisterClient
-                                }
+                                msg.reply_to,
+                                ClientRequestInfo::RegisterClient 
                             );
 
                         // After appending new log entry we broadcast it to all other
