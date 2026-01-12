@@ -178,7 +178,7 @@ impl Raft {
         self.broadcast(&mut msgs).await;
     }
 
-    async fn broadcast_append_entries(&mut self, send_empty_entries: bool) 
+    async fn broadcast_append_entries(&mut self) 
     {
         let header = RaftMessageHeader {
             source: self.config.self_id,
@@ -204,18 +204,24 @@ impl Raft {
                 content: RaftMessageContent::AppendEntries(args)
             };
 
+            msgs.insert(*server_id, append_entries_msg);
+
+            // Below is I think NOT NEEDED, we broadcast only when we either append
+            // new entry - so everyone has new entry, or when hearbeat so everyone
+            // has either zero entries or a few entries
+
             // So that we can control if we want to send append entries without logs
-            if args_entries_are_empty
-            {
-                if send_empty_entries
-                {
-                    msgs.insert(*server_id, append_entries_msg);
-                }
-            }
-            else
-            {
-                msgs.insert(*server_id, append_entries_msg);
-            }
+            // if args_entries_are_empty
+            // {
+            //     if send_empty_entries
+            //     {
+            //         msgs.insert(*server_id, append_entries_msg);
+            //     }
+            // }
+            // else
+            // {
+            //     msgs.insert(*server_id, append_entries_msg);
+            // }
         }
         self.broadcast(&mut msgs).await;
     }
@@ -393,12 +399,6 @@ impl Raft {
             {
                 match &log_entry.content
                 {
-                    // TODO: 1) complete handling this case, we should remove command
-                    // index from leader_state.cmd_idx_to_client_id
-                    // and move from c_session.pending_cmds to executed_cmds
-                    // than reply to Client
-                    // 2) In cmd_idx_to_client_id we should store EITHER client_id
-                    // or reply_to since SNAPSHOT doesn't have client Id
                     LogEntryContent::Command { 
                         data, 
                         client_id, 
@@ -407,6 +407,12 @@ impl Raft {
                     } => {
                         let result = self.state_machine.apply(data).await;
                         self.state.volatile.leader_state.
+                            move_from_pending_to_executed(
+                               *sequence_num, 
+                               *client_id, 
+                               &result, 
+                               *lowest_sequence_num_without_response
+                        );
                     },
                     // We skip all logs apart from Command logs, since only these 
                     // we want to apply to our StateMachine - I think
@@ -848,7 +854,7 @@ impl Raft {
                             self.state.persistent.log.len().checked_sub(1).unwrap() 
                         );
 
-                        self.broadcast_append_entries(true).await;
+                        self.broadcast_append_entries().await;
                         self.reset_heartbeat_timer().await;
                         self.reset_election_timer().await;
                     }
@@ -971,7 +977,7 @@ impl Handler<HeartbeatTimeout> for Raft
                 heartbeat_response_count.clear();
 
                 // We send heartbeat to all servers
-                self.broadcast_append_entries(true).await;
+                self.broadcast_append_entries().await;
             },
             _ => {
                 // If we are not a LEADER, this means we got an old Heartbeat, 
@@ -1050,38 +1056,61 @@ impl Handler<ClientRequest> for Raft
                         sequence_num, 
                         lowest_sequence_num_without_response 
                     } => {
-                        let log_content = LogEntryContent::Command { 
-                            data: command, 
-                            client_id, 
-                            sequence_num, 
-                            lowest_sequence_num_without_response 
-                        };
+                        match self.state.volatile.leader_state
+                            .state_of_cmd_with_sequence_num(sequence_num, client_id)
+                        {
+                            ClientCmdState::NotPresent => {
+                                // We add new entry to log, and wait for commit 
+                                // before replying.
+                                let log_content = LogEntryContent::Command { 
+                                    data: command, 
+                                    client_id, 
+                                    sequence_num, 
+                                    lowest_sequence_num_without_response 
+                                };
+                                let log_entry = LogEntry {
+                                    content: log_content,
+                                    term: self.state.persistent.current_term,
+                                    timestamp: self.get_current_timestamp()
+                                };
 
-                        let log_entry = LogEntry {
-                            content: log_content,
-                            term: self.state.persistent.current_term,
-                            timestamp: self.get_current_timestamp()
-                        };
+                                self.state.persistent.log.push(log_entry);
+                                self.save_to_stable_storage().await;
 
-                        self.state.persistent.log.push(log_entry);
-                        self.save_to_stable_storage().await;
+                                self.state.volatile.leader_state
+                                    .insert_new_statemachine_pending_cmd(
+                                        client_id,
+                                        msg.reply_to,
+                                        sequence_num
+                                    );
+                                self.broadcast_append_entries().await;
+                            },
+                            ClientCmdState::Pending => {
+                                // We only update reply_to.
+                            },
+                            ClientCmdState::Executed => {
+                                // We immediately return result.
+                                // TODO: we should update reply_to in leader_state
+                                let res = self.state.volatile.leader_state
+                                    .get_executed_cmd(sequence_num, client_id);
+                                let response_args = CommandResponseArgs { 
+                                            client_id, 
+                                            sequence_num, 
+                                            content: CommandResponseContent
+                                                ::CommandApplied { 
+                                                    output: res.result.clone()
+                                }};
 
-                        let command_index = self.state.persistent.log.len() - 1;
+                                msg.reply_to.send(
+                                    ClientRequestResponse::CommandResponse(
+                                        response_args
+                                ));
+                            }
+                        }
 
-                        self.state.volatile
-                            .leader_state.insert_new_pending_cmd(
-                                client_id,
-                                command_index,
-                                msg.reply_to,
-                                ClientRequestInfo::CommandPlaceholder 
-                            );
-
-                        // After appending new log entry we broadcast it to all other
-                        // servers
-                        self.broadcast_append_entries(false).await;
                     },
                     ClientRequestContent::Snapshot => {
-                        unimplemented!("Follower/Candidate - handling Client Snapshot request not implemented");
+                        unimplemented!("Leader - handling Client Snapshot request not implemented");
                     },
                     ClientRequestContent::AddServer { new_server } => {
                         unimplemented!("Handler<ClientRequest>:: Leader - AddServer unimplemented");
@@ -1092,7 +1121,6 @@ impl Handler<ClientRequest> for Raft
                     ClientRequestContent::RegisterClient => {
                         let client_id = Uuid::new_v4();
                         let log_content = LogEntryContent::RegisterClient; 
-
                         let log_entry = LogEntry {
                             content: log_content,
                             term: self.state.persistent.current_term,
@@ -1103,17 +1131,14 @@ impl Handler<ClientRequest> for Raft
                         self.save_to_stable_storage().await;
 
                         let command_index = self.state.persistent.log.len() - 1;
-                        self.state.volatile
-                            .leader_state.insert_new_pending_cmd(
-                                client_id,
-                                command_index,
-                                msg.reply_to,
-                                ClientRequestInfo::RegisterClient 
-                            );
 
-                        // After appending new log entry we broadcast it to all other
-                        // servers
-                        self.broadcast_append_entries(false).await;
+                        self.state.volatile
+                            .leader_state.insert_new_other_cmd(
+                                command_index,
+                                OtherCommandResult::RegisterClient { client_id }, 
+                                msg.reply_to,
+                            );
+                        self.broadcast_append_entries().await;
                     }
                 }
             },

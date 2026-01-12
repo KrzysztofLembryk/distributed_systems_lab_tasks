@@ -84,6 +84,13 @@ impl VolatileState
     }
 }
 
+pub enum ClientCmdState
+{
+    NotPresent,
+    Pending,
+    Executed,
+}
+
 pub struct VolatileLeaderState
 {
     pub successful_heartbeat_round_happened: bool,
@@ -96,7 +103,10 @@ pub struct VolatileLeaderState
     pub match_index: HashMap<ServerIdT, IndexT>,
 
     pub client_session: HashMap<ClientIdT, ClientSessionData>,
-    pub cmd_idx_to_client_id: HashMap<IndexT, ClientIdT>,
+    pub index_to_other_cmd: HashMap<
+        IndexT, 
+        (UnboundedSender<ClientRequestResponse>, OtherCommandResult)
+    >,
 }
 
 impl VolatileLeaderState
@@ -124,7 +134,7 @@ impl VolatileLeaderState
             next_index, 
             match_index,
             client_session: HashMap::new(),
-            cmd_idx_to_client_id: HashMap::new(),
+            index_to_other_cmd: HashMap::new(),
         };
     }
 
@@ -144,63 +154,153 @@ impl VolatileLeaderState
             self.next_index.insert(*server_id, next_index_val);
             self.match_index.insert(*server_id, 0);
         }
+
+        // TODO: Do we clear these?
+        self.client_session.clear();
+        self.index_to_other_cmd.clear();
     }
 
-    pub fn insert_new_pending_cmd(
-        &mut self,
+    pub fn state_of_cmd_with_sequence_num(
+        &self,
+        command_sequence_num: SequenceNumT,
         client_id: ClientIdT,
-        command_index: IndexT,
-        reply_to: UnboundedSender<ClientRequestResponse>,
-        request_info: ClientRequestInfo
-    )
+    ) -> ClientCmdState
     {
-        self.cmd_idx_to_client_id.insert(command_index, client_id);
-
-        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        if let Some(c_session) = self.client_session.get(&client_id)
         {
-            c_session.reply_to = reply_to;
-            c_session.pending_cmds.insert(command_index, request_info);
+            let is_in_pending = 
+                c_session.pending_cmds.contains(&command_sequence_num);
+            let is_in_executed = 
+                c_session.executed_cmds.contains_key(&command_sequence_num);
+
+            if is_in_pending && is_in_executed
+            {
+                panic!(
+                    "VolatileLeaderState::is_cmd_with_given_sequence_already_executed:: command with sequence number: '{}', for client: '{}' exists both in pending and in executed",command_sequence_num, client_id
+                );
+            }
+
+            if is_in_pending
+            {
+                return ClientCmdState::Pending;
+            }
+            else if is_in_executed
+            {
+                return ClientCmdState::Executed;
+            }
+            else
+            {
+                return ClientCmdState::NotPresent;
+            }
+        }
+        return ClientCmdState::NotPresent;
+    }
+
+    /// This function should be used only after checking the state of command with
+    /// function: state_of_cmd_with_sequence_num
+    pub fn get_executed_cmd(
+        &self,
+        command_sequence_num: SequenceNumT,
+        client_id: ClientIdT,
+    ) -> &StateMachineCommandResult
+    {
+        if let Some(c_session) = self.client_session.get(&client_id)
+        {
+            if let Some((_,res)) = c_session.executed_cmds.get(&command_sequence_num)
+            {
+                return res;
+            }
+            else
+            {
+                panic!("VolatileLeaderState::get_executed_cmd:: for client: '{}' there is no executed command with sequence number: '{}'", client_id, command_sequence_num);
+            }
         }
         else
         {
-            self.client_session.insert(client_id, ClientSessionData { 
-                reply_to, 
-                executed_cmds: HashMap::new(), 
-                pending_cmds: HashMap::from([(command_index, request_info)])
+            panic!("VolatileLeaderState::get_executed_cmd:: there is no session for client: '{}'", client_id);
+        }
+    }
+
+    pub fn move_from_pending_to_executed(
+        &mut self,
+        command_sequence_num: SequenceNumT,
+        client_id: ClientIdT,
+        res_data: &Vec<u8>,
+        lowest_sequence_num_without_response: u64,
+    )
+    {
+        unimplemented!("Implement me");
+    }
+
+    pub fn insert_new_statemachine_pending_cmd(
+        &mut self,
+        client_id: ClientIdT,
+        reply_to: UnboundedSender<ClientRequestResponse>,
+        command_sequence_num: SequenceNumT
+    )
+    {
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            c_session.reply_to = reply_to;
+            c_session.pending_cmds.insert(command_sequence_num);
+        }
+        else
+        {
+            self.client_session.insert(
+                client_id, 
+                ClientSessionData { 
+                    reply_to, 
+                    executed_cmds: HashMap::new(), 
+                    pending_cmds: HashSet::from([command_sequence_num])
             });
         }
     }
+
+    pub fn insert_new_other_cmd(
+        &mut self,
+        command_index: IndexT,
+        cmd: OtherCommandResult,
+        reply_to: UnboundedSender<ClientRequestResponse>,
+    )
+    {
+        assert!(
+            self.index_to_other_cmd.contains_key(&command_index), 
+            "In VolatileLeaderState.index_to_other_cmd, index: '{}' already exists", command_index
+        );
+
+        self.index_to_other_cmd.insert(command_index, (reply_to, cmd));
+    }
 }
 
+/// In client session we store only ClientRequest::Command results and their 
+/// Sequence Numbers
 pub struct ClientSessionData
 {
     pub reply_to: UnboundedSender<ClientRequestResponse>,
-    // we store only ClientRequest::Command responses, since only they change 
-    // StateMachine
-    pub executed_cmds: HashMap<SequenceNumT, (IndexT, ClientRequestInfo)>,
-    // Pending commands may be different
-    pub pending_cmds: HashMap<IndexT, ClientRequestInfo>,
+    pub executed_cmds: HashMap<SequenceNumT, (IndexT, StateMachineCommandResult)>,
+    pub pending_cmds: HashSet<SequenceNumT>,
 }
 
-pub enum ClientRequestInfo {
-    /// Apply a command to the state machine.
-    Command {
-        result: Vec<u8>,
-        client_id: Uuid,
-        sequence_num: u64,
-        lowest_sequence_num_without_response: u64,
-    },
-    // Only info that we had command
-    CommandPlaceholder,
+pub struct StateMachineCommandResult
+{
+    pub result: Vec<u8>,
+    pub client_id: Uuid,
+    pub sequence_num: u64,
+    pub lowest_sequence_num_without_response: u64,
+}
+
+
+pub enum OtherCommandResult {
     /// Create a snapshot of the current state of the state machine.
     Snapshot,
     /// Add a server to the cluster.
-    AddServer,
+    AddServer { new_server: ServerIdT },
     /// Remove a server from the cluster.
-    RemoveServer,
+    RemoveServer { old_server: ServerIdT },
     /// Open a new client session.
-    RegisterClient,
+    RegisterClient { client_id: ClientIdT },
 }
+
 pub enum ServerType {
     Follower,
     Candidate {
