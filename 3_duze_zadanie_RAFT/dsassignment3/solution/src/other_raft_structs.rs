@@ -1,10 +1,11 @@
 use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::Instant;
 use std::{collections::{HashSet, HashMap}};
 use uuid::Uuid;
 
-use crate::domain::{Timestamp, LogEntryContent, LogEntry};
-use crate::types_defs::{IndexT, ServerIdT, TermT};
+use crate::domain::{Timestamp, LogEntryContent, LogEntry, ClientRequestResponse};
+use crate::types_defs::{IndexT, ServerIdT, TermT, ClientIdT, SequenceNumT};
 
 pub struct ServerState
 {
@@ -92,7 +93,9 @@ pub struct VolatileLeaderState
     pub next_index: HashMap<ServerIdT, IndexT>,
     // for each server, index of highest log entry known to be replicated on server
     // (initialized to 0, increases monotically)
-    pub match_index: HashMap<ServerIdT, IndexT>
+    pub match_index: HashMap<ServerIdT, IndexT>,
+
+    pub client_session: HashMap<ClientIdT, ClientSessionData>
 }
 
 impl VolatileLeaderState
@@ -118,13 +121,14 @@ impl VolatileLeaderState
             successful_heartbeat_round_happened: false, 
             responses_from_followers, 
             next_index, 
-            match_index 
+            match_index,
+            client_session: HashMap::new()
         };
     }
 
     pub fn reinitialize(&mut self, 
         server_ids: &HashSet<ServerIdT>,
-        last_log_index: IndexT
+        next_index_val: IndexT
     )
     {
         self.successful_heartbeat_round_happened = false;
@@ -135,12 +139,38 @@ impl VolatileLeaderState
 
         for server_id in server_ids
         {
-            self.next_index.insert(*server_id, last_log_index);
+            self.next_index.insert(*server_id, next_index_val);
             self.match_index.insert(*server_id, 0);
         }
     }
+
+    pub fn insert_
 }
 
+pub struct ClientSessionData
+{
+    pub reply_to: UnboundedSender<ClientRequestResponse>,
+    pub executed_cmds: HashMap<SequenceNumT, (IndexT, ClientRequestInfo)>,
+    pub pending_cmds: HashMap<IndexT, SequenceNumT>,
+}
+
+pub enum ClientRequestInfo {
+    /// Apply a command to the state machine.
+    Command {
+        result: Vec<u8>,
+        client_id: Uuid,
+        sequence_num: u64,
+        lowest_sequence_num_without_response: u64,
+    },
+    /// Create a snapshot of the current state of the state machine.
+    Snapshot,
+    /// Add a server to the cluster.
+    AddServer,
+    /// Remove a server from the cluster.
+    RemoveServer,
+    /// Open a new client session.
+    RegisterClient,
+}
 pub enum ServerType {
     Follower,
     Candidate {

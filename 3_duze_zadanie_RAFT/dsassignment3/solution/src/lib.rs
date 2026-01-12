@@ -8,7 +8,7 @@ use log::{debug, warn, info};
 pub use domain::*;
 use crate::types_defs::{IndexT, ServerIdT, TermT};
 
-use crate::other_raft_structs::VolatileState;
+use crate::other_raft_structs::*;
 
 mod types_defs;
 mod other_raft_structs;
@@ -49,13 +49,19 @@ impl Raft {
     ) -> ModuleRef<Self> 
     {
         let mut state_machine = state_machine;
+        let volatile_state: VolatileState = 
+            VolatileState::new(&config.servers);
         let persistent_state: PersistentState;
 
         if let Some(retrieved_state) = 
             stable_storage.get(&config.self_id.to_string()).await
         {
             persistent_state = decode_from_slice(&retrieved_state).unwrap();
-            recover_state_machine(&persistent_state, &mut state_machine).await;
+            recover_state_machine(
+                &persistent_state, 
+                &mut state_machine,
+                volatile_state.last_applied
+            ).await;
         }
         else
         {
@@ -65,8 +71,6 @@ impl Raft {
         let _ = persistent_state.log.len().checked_sub(1).expect("
         Raft::new():: checked_sub panicked, thus persistent_state.log.len() is 0, this should never happen, stable_storage must have had corrupted data inside");
         
-        let volatile_state: VolatileState = 
-            VolatileState::new(&config.servers);
 
         let state = ServerState { 
             persistent: persistent_state, 
@@ -90,6 +94,11 @@ impl Raft {
         self_ref.send(Init).await;
 
         return self_ref;
+    }
+
+    fn get_current_timestamp(&self) -> Duration
+    {
+        return Instant::now().duration_since(self.config.system_boot_time);
     }
 
     fn get_minimal_election_timeout(&self) -> &Duration
@@ -168,7 +177,7 @@ impl Raft {
         self.broadcast(&mut msgs).await;
     }
 
-    async fn broadcast_append_entries(&mut self) 
+    async fn broadcast_append_entries(&mut self, send_empty_entries: bool) 
     {
         let header = RaftMessageHeader {
             source: self.config.self_id,
@@ -187,12 +196,25 @@ impl Raft {
 
             let args = 
                 self.create_append_entries_args_for_given_server(server_id);
+            let args_entries_are_empty = args.entries.is_empty();
+
             let append_entries_msg = RaftMessage {
                 header: header.clone(), 
                 content: RaftMessageContent::AppendEntries(args)
             };
 
-            msgs.insert(*server_id, append_entries_msg);
+            // So that we can control if we want to send append entries without logs
+            if args_entries_are_empty
+            {
+                if send_empty_entries
+                {
+                    msgs.insert(*server_id, append_entries_msg);
+                }
+            }
+            else
+            {
+                msgs.insert(*server_id, append_entries_msg);
+            }
         }
         self.broadcast(&mut msgs).await;
     }
@@ -257,13 +279,13 @@ impl Raft {
 
     async fn broadcast(&mut self, msgs: &mut HashMap<ServerIdT, RaftMessage>)
     {
-        for server_id in &self.config.servers
+        for (server_id, msg) in msgs.drain()
         {
-            // We don't send msgs to ourselves
-            if self.config.self_id != *server_id
+            // We don't send msgs to ourselves, and send msgs only to known servers
+            if self.config.self_id != server_id 
+            && self.config.servers.contains(&server_id)
             {
-                let msg = msgs.remove(server_id).expect("Raft::broadcast:: msgs.remove() returned None, it means that there wasn't a msg for given server, this should never happen, since we should've created an AppendEntries msg for every server");
-                self.msg_sender.send(server_id, msg).await;
+                self.msg_sender.send(&server_id, msg).await;
             }
         }
     }
@@ -803,8 +825,7 @@ impl Raft {
                         self.state.persistent.log.push(LogEntry {
                             content: LogEntryContent::NoOp,
                             term: self.state.persistent.current_term,
-                            timestamp: Instant::now()
-                                        .duration_since(self.config.system_boot_time)
+                            timestamp: self.get_current_timestamp() 
                         });
                         self.save_to_stable_storage().await;
 
@@ -813,7 +834,8 @@ impl Raft {
                             &self.config.servers, 
                             self.state.persistent.log.len().checked_sub(1).unwrap() 
                         );
-                        self.broadcast_append_entries().await;
+
+                        self.broadcast_append_entries(true).await;
                         self.reset_heartbeat_timer().await;
                         self.reset_election_timer().await;
                     }
@@ -936,7 +958,7 @@ impl Handler<HeartbeatTimeout> for Raft
                 heartbeat_response_count.clear();
 
                 // We send heartbeat to all servers
-                self.broadcast_append_entries().await;
+                self.broadcast_append_entries(true).await;
             },
             _ => {
                 // If we are not a LEADER, this means we got an old Heartbeat, 
@@ -1006,9 +1028,144 @@ impl Handler<ClientRequest> for Raft
     {
         match self.role
         {
-            ServerType::Follower => {
-                let response = ClientRequestResponse {
+            ServerType::Leader => {
+                match msg.content
+                {
+                    ClientRequestContent::Command { 
+                        command, 
+                        client_id, 
+                        sequence_num, 
+                        lowest_sequence_num_without_response 
+                    } => {
+                        let log_content = LogEntryContent::Command { 
+                            data: command, 
+                            client_id, 
+                            sequence_num, 
+                            lowest_sequence_num_without_response 
+                        };
 
+                        let log_entry = LogEntry {
+                            content: log_content,
+                            term: self.state.persistent.current_term,
+                            timestamp: self.get_current_timestamp()
+                        };
+
+                        self.state.persistent.log.push(log_entry);
+                        self.save_to_stable_storage().await;
+
+                        let command_index = self.state.persistent.log.len() - 1;
+                        self.state.volatile
+                            .leader_state.client_session.insert(
+                                command_index,
+                                ClientRequestInfo { 
+                                    log_index: command_index, 
+                                    reply_to: msg.reply_to, 
+                                    client_request_cmd: ClientRequestInfo::Command
+                                }
+                            );
+
+                        // After appending new log entry we broadcast it to all other
+                        // servers
+                        self.broadcast_append_entries(false).await;
+                    },
+                    ClientRequestContent::Snapshot => {
+                        unimplemented!("Follower/Candidate - handling Client Snapshot request not implemented");
+                    },
+                    ClientRequestContent::AddServer { new_server } => {
+                        unimplemented!("Handler<ClientRequest>:: Leader - AddServer unimplemented");
+                    },
+                    ClientRequestContent::RemoveServer { old_server } => {
+                        unimplemented!("Handler<ClientRequest>:: Leader - RemoveServer unimplemented");
+                    },
+                    ClientRequestContent::RegisterClient => {
+                        let log_content = LogEntryContent::RegisterClient; 
+
+                        let log_entry = LogEntry {
+                            content: log_content,
+                            term: self.state.persistent.current_term,
+                            timestamp: self.get_current_timestamp()
+                        };
+
+                        self.state.persistent.log.push(log_entry);
+                        self.save_to_stable_storage().await;
+
+                        let command_index = self.state.persistent.log.len() - 1;
+                        self.state.volatile
+                            .leader_state.client_session.insert(
+                                command_index,
+                                ClientRequestInfo { 
+                                    log_index: command_index, 
+                                    reply_to: msg.reply_to, 
+                                    client_request_cmd: ClientRequestInfo::RegisterClient
+                                }
+                            );
+
+                        // After appending new log entry we broadcast it to all other
+                        // servers
+                        self.broadcast_append_entries(false).await;
+                    }
+                }
+            },
+            _ => {
+                // Anyone apart from Leader rejects Client request
+                match msg.content
+                {
+                    ClientRequestContent::Command {client_id, sequence_num, ..} => {
+                        let response_args = CommandResponseArgs {
+                            client_id,
+                            sequence_num,
+                            content: CommandResponseContent::NotLeader { 
+                                leader_hint: self.state.volatile.leader_id
+                            }
+                        };
+                        let response = ClientRequestResponse::CommandResponse(
+                            response_args
+                        );
+
+                        // We don't care if client still has channel opened or not
+                        // we just send msg
+                        let _ = msg.reply_to.send(response);
+                    },
+                    ClientRequestContent::Snapshot => {
+                        unimplemented!("Follower/Candidate - handling Client Snapshot request not implemented");
+                    },
+                    ClientRequestContent::AddServer { new_server } => {
+                        let args = AddServerResponseArgs {
+                            new_server,
+                            content: AddServerResponseContent::NotLeader {  
+                                leader_hint: self.state.volatile.leader_id
+                            }
+                        };
+                        let response = 
+                            ClientRequestResponse::AddServerResponse(args);
+
+                        let _ = msg.reply_to.send(response);
+                    },
+                    ClientRequestContent::RemoveServer { old_server } => {
+                        let args = RemoveServerResponseArgs {
+                            old_server,
+                            content: RemoveServerResponseContent::NotLeader { 
+                                leader_hint: self.state.volatile.leader_id
+                            }
+                        };
+
+                        let response = 
+                            ClientRequestResponse::RemoveServerResponse(args);
+
+                        let _ = msg.reply_to.send(response);
+                    },
+                    ClientRequestContent::RegisterClient => {
+                        let args = RegisterClientResponseArgs {
+                            content: RegisterClientResponseContent::NotLeader { 
+                                leader_hint: self.state.volatile.leader_id
+                            }
+                        };
+
+                        let response = 
+                            ClientRequestResponse::RegisterClientResponse(args);
+
+                        let _ = msg.reply_to.send(response);
+                    }
                 }
             }
         }
@@ -1019,13 +1176,19 @@ impl Handler<ClientRequest> for Raft
 
 async fn recover_state_machine(
     persistent_state: &PersistentState, 
-    state_machine: &mut Box<dyn StateMachine>
+    state_machine: &mut Box<dyn StateMachine>,
+    last_applied_idx: IndexT
 )
 {
     // Since state machine is volatile it must be recovered after restart by
     // reapplying log entries (after applying latest snapshot)
-    for cmd in &persistent_state.log
+    for (idx, cmd) in persistent_state.log.iter().enumerate()
     {
+        // We reapply log entries only till the last_applied_idx we got from snapshot
+        if idx > last_applied_idx
+        {
+            break;
+        }
         match &cmd.content
         {
             LogEntryContent::Command { data, .. } => {
