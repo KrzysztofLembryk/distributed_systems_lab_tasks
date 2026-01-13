@@ -381,6 +381,569 @@ pub(crate) mod tests {
         system.shutdown().await;
     }
 
+
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn transformations_delete() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "abc";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // Test: if p1 < p2: delete(p1, r1)
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "bc")
+        );
+
+        c[1].request(Action::Delete { idx: 2 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 2 }, "ab")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 1 }, "b")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "b")
+        );
+
+        // Test: if p1 = p2: NOP (both delete same position)
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "")
+        );
+
+        c[1].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Nop, "")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Nop, "")
+        );
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn transformations_insert_vs_delete() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "abc";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // P0 inserts, P1 deletes
+        // Test: Transform insert(p1, c1, r1) wrt delete(p2, r2)
+        c[0].request(Action::Insert { idx: 2, ch: 'X' }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 2, ch: 'X' }, "abXc")
+        );
+
+        c[1].request(Action::Delete { idx: 1 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 1 }, "ac")
+        );
+
+        // if p1 <= p2: insert(p1, c1, r1)
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 1 }, "aXc")
+        );
+
+        // else: insert(p1 - 1, c1, r1)
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 1, ch: 'X' }, "aXc")
+        );
+
+        // Test: Transform delete(p1, r1) wrt insert(p2, c2, r2)
+        c[0].request(Action::Delete { idx: 1 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 1 }, "ac")
+        );
+
+        c[1].request(Action::Insert { idx: 1, ch: 'Y' }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 1, ch: 'Y' }, "aYXc")
+        );
+
+        // else: delete(p1 + 1, r1)
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 1, ch: 'Y' }, "aYc")
+        );
+
+        // if p1 < p2: delete(p1, r1)
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 2 }, "aYc")
+        );
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn two_processes_mixed_operations() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "hello";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // P0 inserts, P1 deletes
+        c[0].request(Action::Insert { idx: 5, ch: '!' }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 5, ch: '!' }, "hello!")
+        );
+
+        c[1].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "ello")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "ello!")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 4, ch: '!' }, "ello!")
+        );
+
+        // P0 deletes, P1 inserts
+        c[0].request(Action::Delete { idx: 4 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 4 }, "ello")
+        );
+
+        c[1].request(Action::Insert { idx: 0, ch: 'H' }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 0, ch: 'H' }, "Hello!")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 0, ch: 'H' }, "Hello")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 5 }, "Hello")
+        );
+
+        system.shutdown().await;
+    }
+
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn three_processes_deletes() {
+        const NUM_PROCESSES: usize = 3;
+        const TEXT: &str = "abcd";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // All processes delete at position 0
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "bcd")
+        );
+
+        c[1].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "bcd")
+        );
+
+        c[2].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[2].receive().await,
+            (Action::Delete { idx: 0 }, "bcd")
+        );
+
+        // P1 -> P0: both deleted same position, becomes NOP
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        // P2 -> P0: both deleted same position, becomes NOP
+        b.forward(2, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        // P2 -> P1: both deleted same position, becomes NOP
+        b.forward(2, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        // P0 -> P1: both deleted same position, becomes NOP
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        // P0 -> P2
+        b.forward(0, 2).await;
+        assert_eq!(
+            c[2].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        // P1 -> P2
+        b.forward(1, 2).await;
+        assert_eq!(
+            c[2].receive().await,
+            (Action::Nop, "bcd")
+        );
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn two_processes_delete_at_once() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "hello";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // P0 sends two delete requests at once
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "ello")
+        );
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert!(c[0].no_receive().await);
+
+        // P1 sends two delete requests at once
+        c[1].request(Action::Delete { idx: 4 }).await;
+        c[1].request(Action::Delete { idx: 3 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 4 }, "hell")
+        );
+        assert!(c[1].no_receive().await);
+
+        // P1 -> P0
+        b.forward(1, 0).await;
+        assert!(b.no_forward(1, 0).await);
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 3 }, "ell")
+        );
+
+        // P0 -> P1
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "ell")
+        );
+
+        // P0 second delete
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "ll")
+        );
+
+        // P1 second delete (needs transformation against P0's second delete)
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 2 }, "el")
+        );
+
+        // P1 second -> P0
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 1 }, "l")
+        );
+
+        // P0 second -> P1
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "l")
+        );
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn mixed_insert_delete_sequence() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "test";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // Round 1: P0 inserts, P1 deletes
+        c[0].request(Action::Insert { idx: 0, ch: 'A' }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 0, ch: 'A' }, "Atest")
+        );
+
+        c[1].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "est")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 1 }, "Aest")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 0, ch: 'A' }, "Aest")
+        );
+
+        // Round 2: P0 deletes, P1 inserts
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Delete { idx: 0 }, "est")
+        );
+
+        c[1].request(Action::Insert { idx: 4, ch: '!' }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 4, ch: '!' }, "Aest!")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 3, ch: '!' }, "est!")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Delete { idx: 0 }, "est!")
+        );
+
+        // Round 3: Both insert at same position
+        c[0].request(Action::Insert { idx: 2, ch: 'B' }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 2, ch: 'B' }, "esBt!")
+        );
+
+        c[1].request(Action::Insert { idx: 2, ch: 'C' }).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 2, ch: 'C' }, "esCt!")
+        );
+
+        b.forward(1, 0).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 3, ch: 'C' }, "esBCt!")
+        );
+
+        b.forward(0, 1).await;
+        assert_eq!(
+            c[1].receive().await,
+            (Action::Insert { idx: 2, ch: 'B' }, "esBCt!")
+        );
+
+        system.shutdown().await;
+    }
+
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn n_equals_one_basic() {
+        const NUM_PROCESSES: usize = 1;
+        const TEXT: &str = "";
+
+        let mut system = System::new().await;
+        let (_b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        c[0].request(Action::Insert { idx: 0, ch: 'A' }).await;
+        
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 0, ch: 'A' }, "A")
+        );
+        
+        c[0].request(Action::Insert { idx: 1, ch: 'B' }).await;
+        assert_eq!(
+            c[0].receive().await,
+            (Action::Insert { idx: 1, ch: 'B' }, "AB")
+        );
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn n_equals_one_basic_2() {
+        const NUM_PROCESSES: usize = 1;
+        const TEXT: &str = "";
+
+        let mut system = System::new().await;
+        let (_b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // Queue up multiple requests immediately
+        c[0].request(Action::Insert { idx: 0, ch: '1' }).await;
+        assert_eq!(c[0].receive().await.1, "1");
+        c[0].request(Action::Insert { idx: 1, ch: '2' }).await;
+        assert_eq!(c[0].receive().await.1, "12");
+        c[0].request(Action::Insert { idx: 2, ch: '3' }).await;
+        assert_eq!(c[0].receive().await.1, "123");
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn n_equals_one_3() {
+        const NUM_PROCESSES: usize = 1;
+        const TEXT: &str = "";
+
+        let mut system = System::new().await;
+        let (_b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        // Queue up multiple requests immediately
+        c[0].request(Action::Insert { idx: 0, ch: '1' }).await;
+        c[0].request(Action::Insert { idx: 0, ch: '2' }).await;
+        c[0].request(Action::Insert { idx: 0, ch: '3' }).await;
+
+        assert_eq!(c[0].receive().await.1, "1");
+        assert_eq!(c[0].receive().await.1, "12");
+        assert_eq!(c[0].receive().await.1, "123");
+
+        system.shutdown().await;
+    }
+
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn test_future_round_buffering() {
+        
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        c[0].request(Action::Insert { idx: 0, ch: 'A' }).await;
+        c[1].request(Action::Insert { idx: 0, ch: 'B' }).await;
+        
+        assert_eq!(c[0].receive().await.1, "A");
+        assert_eq!(c[1].receive().await.1, "B");
+
+        b.forward(0, 1).await;
+        assert_eq!(c[1].receive().await.1, "AB"); 
+
+        c[1].request(Action::Insert { idx: 1, ch: 'C' }).await;
+        assert_eq!(c[1].receive().await.1, "ACB"); 
+
+        b.forward(1, 0).await; 
+        b.forward(1, 0).await;
+
+
+        assert_eq!(c[0].receive().await.1, "AB");
+
+        c[0].request(Action::Insert { idx: 2, ch: 'D' }).await;
+        
+        assert_eq!(c[0].receive().await.1, "AB"); 
+        assert_eq!(c[0].receive().await.1, "ACB"); 
+        assert_eq!(c[0].receive().await.1, "ACBD"); 
+
+        b.forward(0, 1).await;
+        b.forward(0, 1).await;
+
+        assert_eq!(c[1].receive().await.1, "ACB"); 
+        assert_eq!(c[1].receive().await.1, "ACB"); 
+        assert_eq!(c[1].receive().await.1, "ACBD"); 
+
+
+        system.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[timeout(200)]
+    async fn test_delete_transformation() {
+        const NUM_PROCESSES: usize = 2;
+        const TEXT: &str = "XYZ";
+
+        let mut system = System::new().await;
+        let (mut b, mut c) = build_system::<NUM_PROCESSES>(&mut system, TEXT).await;
+
+        c[0].request(Action::Delete { idx: 0 }).await;
+        assert_eq!(c[0].receive().await.1, "YZ");
+
+        c[1].request(Action::Delete { idx: 2 }).await;
+        assert_eq!(c[1].receive().await.1, "XY");
+
+        b.forward(1, 0).await;
+
+        assert_eq!(c[0].receive().await.1, "Y");
+
+        b.forward(0, 1).await;
+        assert_eq!(c[1].receive().await.1, "Y");
+
+        system.shutdown().await;
+    }
+
     pub(crate) async fn build_system<const N: usize>(
         system: &mut System,
         initial_text: &str,

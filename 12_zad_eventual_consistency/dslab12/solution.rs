@@ -273,7 +273,7 @@ impl<const N: usize> Process<N> {
         }
     }
 
-    pub async fn start_new_round_with_client_op(&mut self)
+    pub async fn start_new_round_with_client_op(&mut self) -> bool
     {
         self.curr_round += 1;
 
@@ -289,6 +289,15 @@ impl<const N: usize> Process<N> {
         self.log.push(client_op);
 
         self.curr_round_first_log_idx = self.log.len() - 1;
+
+        // Our client op is always added as first op, so if after adding ONE op we
+        // have all processes it means in our system there is only 1 process, so
+        // we return true so that we can start next round
+        if self.received_from.len() == self.n_proc
+        {
+            return true;
+        }
+        return false;
     }
 
     pub async fn start_new_round_with_nop(&mut self)
@@ -405,7 +414,11 @@ impl<const N: usize> Handler<EditRequest> for Process<N>
 
         if self.received_from.is_empty()
         {
-            self.start_new_round_with_client_op().await;
+            if self.start_new_round_with_client_op().await
+            {
+                // Edge case for system with only ONE process
+                self.start_new_round_when_full().await;
+            }
         }
     }
 }
