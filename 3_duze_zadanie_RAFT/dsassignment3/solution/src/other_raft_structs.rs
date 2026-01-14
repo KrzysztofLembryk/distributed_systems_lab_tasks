@@ -1,10 +1,10 @@
 use serde::{Serialize, Deserialize};
 use tokio::sync::mpsc::UnboundedSender;
-use tokio::time::Instant;
+use tokio::time::{Duration, Instant};
 use std::{collections::{HashSet, HashMap}};
 use uuid::Uuid;
 
-use crate::domain::{Timestamp, LogEntryContent, LogEntry, ClientRequestResponse};
+use crate::domain::{Timestamp, LogEntryContent, LogEntry, ClientRequestResponse, ClientSession};
 use crate::types_defs::{IndexT, ServerIdT, TermT, ClientIdT, SequenceNumT};
 
 pub struct ServerState
@@ -88,7 +88,7 @@ pub enum ClientCmdState
 {
     NotPresent,
     Pending,
-    Executed,
+    Committed,
 }
 
 pub struct VolatileLeaderState
@@ -103,9 +103,11 @@ pub struct VolatileLeaderState
     pub match_index: HashMap<ServerIdT, IndexT>,
 
     pub client_session: HashMap<ClientIdT, ClientSessionData>,
+    // When we get request from client that is NOT COMMAND we also need to store 
+    // channel to which we respond, and index of this command in our log
     pub index_to_other_cmd: HashMap<
         IndexT, 
-        (UnboundedSender<ClientRequestResponse>, OtherCommandResult)
+        (UnboundedSender<ClientRequestResponse>, OtherCommandData)
     >,
 }
 
@@ -168,25 +170,25 @@ impl VolatileLeaderState
     {
         if let Some(c_session) = self.client_session.get(&client_id)
         {
-            let is_in_pending = 
+            let is_pending = 
                 c_session.pending_cmds.contains(&command_sequence_num);
-            let is_in_executed = 
-                c_session.executed_cmds.contains_key(&command_sequence_num);
+            let is_committed = 
+                c_session.session.contains_committed_cmd(&command_sequence_num);
 
-            if is_in_pending && is_in_executed
+            if is_pending && is_committed
             {
                 panic!(
-                    "VolatileLeaderState::is_cmd_with_given_sequence_already_executed:: command with sequence number: '{}', for client: '{}' exists both in pending and in executed",command_sequence_num, client_id
+                    "VolatileLeaderState::is_cmd_with_given_sequence_already_executed:: command with sequence number: '{}', for client: '{}' exists both in pending and in committed",command_sequence_num, client_id
                 );
             }
 
-            if is_in_pending
+            if is_pending
             {
                 return ClientCmdState::Pending;
             }
-            else if is_in_executed
+            else if is_committed
             {
-                return ClientCmdState::Executed;
+                return ClientCmdState::Committed;
             }
             else
             {
@@ -198,26 +200,26 @@ impl VolatileLeaderState
 
     /// This function should be used only after checking the state of command with
     /// function: state_of_cmd_with_sequence_num
-    pub fn get_executed_cmd(
+    pub fn get_committed_cmd_result(
         &self,
         command_sequence_num: SequenceNumT,
         client_id: ClientIdT,
-    ) -> &StateMachineCommandResult
+    ) -> &Vec<u8>
     {
         if let Some(c_session) = self.client_session.get(&client_id)
         {
-            if let Some((_,res)) = c_session.executed_cmds.get(&command_sequence_num)
+            if let Some(res) = c_session.session.responses.get(&command_sequence_num)
             {
                 return res;
             }
             else
             {
-                panic!("VolatileLeaderState::get_executed_cmd:: for client: '{}' there is no executed command with sequence number: '{}'", client_id, command_sequence_num);
+                panic!("VolatileLeaderState::get_executed_cmd:: for client: '{}' there is no committed command with sequence number: '{}', this function shall be invoked only AFTER checking if given command is present and executed, by using: state_of_cmd_with_sequence_num", client_id, command_sequence_num);
             }
         }
         else
         {
-            panic!("VolatileLeaderState::get_executed_cmd:: there is no session for client: '{}'", client_id);
+            panic!("VolatileLeaderState::get_executed_cmd:: there is no session for client: '{}'. This function shall be invoked only AFTER checking if given command is present and executed by using: state_of_cmd_with_sequence_num", client_id);
         }
     }
 
@@ -236,12 +238,16 @@ impl VolatileLeaderState
         &mut self,
         client_id: ClientIdT,
         reply_to: UnboundedSender<ClientRequestResponse>,
-        command_sequence_num: SequenceNumT
+        command_sequence_num: SequenceNumT,
+        lowest_sequence_num_without_response: u64,
+        client_last_activity: Duration
     )
     {
         if let Some(c_session) = self.client_session.get_mut(&client_id)
         {
-            c_session.reply_to = reply_to;
+            // TODO: here we probably should check timestamp or sth like this
+            // maybe update lowest_sequence_num_without_response !!!!!
+            c_session.reply_to.insert(command_sequence_num, reply_to);
             c_session.pending_cmds.insert(command_sequence_num);
         }
         else
@@ -249,8 +255,11 @@ impl VolatileLeaderState
             self.client_session.insert(
                 client_id, 
                 ClientSessionData { 
-                    reply_to, 
-                    executed_cmds: HashMap::new(), 
+                    session: ClientSession::new(
+                        client_last_activity,
+                        lowest_sequence_num_without_response
+                    ),
+                    reply_to: HashMap::from([(command_sequence_num, reply_to)]), 
                     pending_cmds: HashSet::from([command_sequence_num])
             });
         }
@@ -259,7 +268,7 @@ impl VolatileLeaderState
     pub fn insert_new_other_cmd(
         &mut self,
         command_index: IndexT,
-        cmd: OtherCommandResult,
+        cmd: OtherCommandData,
         reply_to: UnboundedSender<ClientRequestResponse>,
     )
     {
@@ -276,21 +285,19 @@ impl VolatileLeaderState
 /// Sequence Numbers
 pub struct ClientSessionData
 {
-    pub reply_to: UnboundedSender<ClientRequestResponse>,
-    pub executed_cmds: HashMap<SequenceNumT, (IndexT, StateMachineCommandResult)>,
+    // In session we store last activity timestamp, responses for give seqNum
+    // and lowest_sequence_num_without_response
+    pub session: ClientSession,
+    // For given SeqNum with client request we got channel to send back result
+    pub reply_to: HashMap<SequenceNumT, UnboundedSender<ClientRequestResponse>>,
+    // Pending, meaning not committed client requests so that we can easily check
+    // for duplicate requests
     pub pending_cmds: HashSet<SequenceNumT>,
 }
 
-pub struct StateMachineCommandResult
-{
-    pub result: Vec<u8>,
-    pub client_id: Uuid,
-    pub sequence_num: u64,
-    pub lowest_sequence_num_without_response: u64,
-}
 
 
-pub enum OtherCommandResult {
+pub enum OtherCommandData {
     /// Create a snapshot of the current state of the state machine.
     Snapshot,
     /// Add a server to the cluster.

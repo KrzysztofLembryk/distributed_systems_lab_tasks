@@ -388,6 +388,7 @@ impl Raft {
     /// as long as last_applied < commit_index
     async fn apply_commited_cmds_to_state_machine(&mut self)
     {
+        // TODO: we need to add responding to msgs of clients here 
         let commit_index = self.state.volatile.commit_index;
 
         while commit_index > self.state.volatile.last_applied
@@ -1062,6 +1063,9 @@ impl Handler<ClientRequest> for Raft
                             ClientCmdState::NotPresent => {
                                 // We add new entry to log, and wait for commit 
                                 // before replying.
+                                let client_last_activity_timestamp = 
+                                    self.get_current_timestamp();
+
                                 let log_content = LogEntryContent::Command { 
                                     data: command, 
                                     client_id, 
@@ -1071,37 +1075,40 @@ impl Handler<ClientRequest> for Raft
                                 let log_entry = LogEntry {
                                     content: log_content,
                                     term: self.state.persistent.current_term,
-                                    timestamp: self.get_current_timestamp()
+                                    timestamp: client_last_activity_timestamp
                                 };
 
                                 self.state.persistent.log.push(log_entry);
                                 self.save_to_stable_storage().await;
-
                                 self.state.volatile.leader_state
                                     .insert_new_statemachine_pending_cmd(
                                         client_id,
                                         msg.reply_to,
-                                        sequence_num
+                                        sequence_num,
+                                        lowest_sequence_num_without_response,
+                                        client_last_activity_timestamp
                                     );
                                 self.broadcast_append_entries().await;
                             },
                             ClientCmdState::Pending => {
-                                // We only update reply_to.
+                                // TODO: Don't really know what to do here, update 
+                                // reply_to for given sequence_num??
                             },
-                            ClientCmdState::Executed => {
+                            ClientCmdState::Committed => {
                                 // We immediately return result.
-                                // TODO: we should update reply_to in leader_state
                                 let res = self.state.volatile.leader_state
-                                    .get_executed_cmd(sequence_num, client_id);
+                                    .get_committed_cmd_result(sequence_num, client_id);
                                 let response_args = CommandResponseArgs { 
                                             client_id, 
                                             sequence_num, 
                                             content: CommandResponseContent
                                                 ::CommandApplied { 
-                                                    output: res.result.clone()
+                                                    output: res.clone()
                                 }};
 
-                                msg.reply_to.send(
+                                // TODO: if channel closed we probably shouldn't do anything, since deleteing client session will be done
+                                // in different way
+                                let _ = msg.reply_to.send(
                                     ClientRequestResponse::CommandResponse(
                                         response_args
                                 ));
@@ -1135,7 +1142,7 @@ impl Handler<ClientRequest> for Raft
                         self.state.volatile
                             .leader_state.insert_new_other_cmd(
                                 command_index,
-                                OtherCommandResult::RegisterClient { client_id }, 
+                                OtherCommandData::RegisterClient { client_id }, 
                                 msg.reply_to,
                             );
                         self.broadcast_append_entries().await;
@@ -1151,7 +1158,7 @@ impl Handler<ClientRequest> for Raft
                             client_id,
                             sequence_num,
                             content: CommandResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id
+                                leader_hint: self.state.volatile.leader_id.clone()
                             }
                         };
                         let response = ClientRequestResponse::CommandResponse(
@@ -1169,7 +1176,7 @@ impl Handler<ClientRequest> for Raft
                         let args = AddServerResponseArgs {
                             new_server,
                             content: AddServerResponseContent::NotLeader {  
-                                leader_hint: self.state.volatile.leader_id
+                                leader_hint: self.state.volatile.leader_id.clone()
                             }
                         };
                         let response = 
@@ -1181,7 +1188,7 @@ impl Handler<ClientRequest> for Raft
                         let args = RemoveServerResponseArgs {
                             old_server,
                             content: RemoveServerResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id
+                                leader_hint: self.state.volatile.leader_id.clone()
                             }
                         };
 
@@ -1193,7 +1200,7 @@ impl Handler<ClientRequest> for Raft
                     ClientRequestContent::RegisterClient => {
                         let args = RegisterClientResponseArgs {
                             content: RegisterClientResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id
+                                leader_hint: self.state.volatile.leader_id.clone()
                             }
                         };
 

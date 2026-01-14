@@ -282,10 +282,30 @@ pub struct InstallSnapshotArgs {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ClientSession {
+pub struct ClientSession 
+{
     pub last_activity: Timestamp,
+    // SequenceT = u64;
     pub responses: HashMap<u64, Vec<u8>>,
     pub lowest_sequence_num_without_response: u64,
+}
+
+impl ClientSession
+{
+    pub fn new(
+        client_last_activity: Duration,
+        lowest_sequence_num_without_response: u64) -> ClientSession
+    {
+        return ClientSession { 
+            last_activity: client_last_activity, 
+            responses: HashMap::new(), 
+            lowest_sequence_num_without_response 
+        };
+    }
+    pub fn contains_committed_cmd(&self, seq_num: &u64) -> bool
+    {
+        return self.responses.contains_key(&seq_num);
+    }
 }
 
 #[derive(Clone, Eq, PartialEq, Debug)]
