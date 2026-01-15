@@ -97,7 +97,7 @@ impl Raft {
         return self_ref;
     }
 
-    fn get_current_timestamp(&self) -> Duration
+    fn get_current_timestamp(&self) -> Timestamp
     {
         return Instant::now().duration_since(self.config.system_boot_time);
     }
@@ -197,7 +197,6 @@ impl Raft {
 
             let args = 
                 self.create_append_entries_args_for_given_server(server_id);
-            let args_entries_are_empty = args.entries.is_empty();
 
             let append_entries_msg = RaftMessage {
                 header: header.clone(), 
@@ -205,23 +204,6 @@ impl Raft {
             };
 
             msgs.insert(*server_id, append_entries_msg);
-
-            // Below is I think NOT NEEDED, we broadcast only when we either append
-            // new entry - so everyone has new entry, or when hearbeat so everyone
-            // has either zero entries or a few entries
-
-            // So that we can control if we want to send append entries without logs
-            // if args_entries_are_empty
-            // {
-            //     if send_empty_entries
-            //     {
-            //         msgs.insert(*server_id, append_entries_msg);
-            //     }
-            // }
-            // else
-            // {
-            //     msgs.insert(*server_id, append_entries_msg);
-            // }
         }
         self.broadcast(&mut msgs).await;
     }
@@ -394,9 +376,10 @@ impl Raft {
         while commit_index > self.state.volatile.last_applied
         {
             self.state.volatile.last_applied += 1;
+            let curr_cmd_index = self.state.volatile.last_applied;
 
             if let Some(log_entry) = 
-                self.state.persistent.log.get(self.state.volatile.last_applied)
+                self.state.persistent.log.get(curr_cmd_index)
             {
                 match &log_entry.content
                 {
@@ -408,23 +391,50 @@ impl Raft {
                     } => {
                         let result = self.state_machine.apply(data).await;
                         self.state.volatile.leader_state.
-                            move_from_pending_to_executed(
+                            move_from_pending_to_committed(
                                *sequence_num, 
                                *client_id, 
                                &result, 
                                *lowest_sequence_num_without_response
                         );
                     },
-                    // We skip all logs apart from Command logs, since only these 
-                    // we want to apply to our StateMachine - I think
                     LogEntryContent::NoOp => {
-
+                        // doing nothing
                     },
                     LogEntryContent::Configuration { .. } => {
 
                     },
                     LogEntryContent::RegisterClient => {
+                        // Log index for given command is unique, and if command is
+                        // committed all servers will have this very command for 
+                        // this index, thus based on this index value we can create
+                        // Uuid
+                        let client_id = uuid_from_log_index(curr_cmd_index);
+                        let client_last_activity = self.get_current_timestamp();
 
+                        self.state.volatile.leader_state
+                            .add_new_client_session(client_id, client_last_activity);
+
+                        match self.role
+                        {
+                            ServerType::Leader => {
+                                // Only leader responds to client
+                                self.state.volatile.leader_state.reply_to_other_cmd(
+                                    curr_cmd_index, 
+                                    ClientRequestResponse::RegisterClientResponse(
+                                        RegisterClientResponseArgs {
+                                            content: RegisterClientResponseContent::ClientRegistered { 
+                                                client_id 
+                                            }
+                                        }
+                                    )
+                                );
+                            },
+                            _ => {
+                                // anyone else just adds client session and doesn't 
+                                // respond
+                            }
+                        }
                     }
                 }
             }
@@ -1060,9 +1070,40 @@ impl Handler<ClientRequest> for Raft
                         match self.state.volatile.leader_state
                             .state_of_cmd_with_sequence_num(sequence_num, client_id)
                         {
+                            ClientCmdState::NoClientSession => {
+                                // Client doesn't have session so we reply 
+                                // SessionExpired - he should send RegisterClient 
+                                // request first
+                                let args = CommandResponseArgs {
+                                    client_id,
+                                    sequence_num,
+                                    content: CommandResponseContent::SessionExpired
+                                };
+
+                                let _ = msg.reply_to.send(
+                                    ClientRequestResponse::CommandResponse(args)
+                                );
+                            },
+                            ClientCmdState::AlreadyDiscarded => {
+                                // Client asks for result of CMD that is already 
+                                // discarded thus we return session expired,
+                                // since correctly working client won't do that
+                                // TODO: should we end client's session if we get
+                                // such command from him?
+                                let args = CommandResponseArgs {
+                                    client_id,
+                                    sequence_num,
+                                    content: CommandResponseContent::SessionExpired
+                                };
+
+                                let _ = msg.reply_to.send(
+                                    ClientRequestResponse::CommandResponse(args)
+                                );
+                            },
                             ClientCmdState::NotPresent => {
                                 // We add new entry to log, and wait for commit 
-                                // before replying.
+                                // before checking timestamp, changing 
+                                // lowest_seq_nbr before replying.
                                 let client_last_activity_timestamp = 
                                     self.get_current_timestamp();
 
@@ -1085,19 +1126,27 @@ impl Handler<ClientRequest> for Raft
                                         client_id,
                                         msg.reply_to,
                                         sequence_num,
-                                        lowest_sequence_num_without_response,
-                                        client_last_activity_timestamp
                                     );
                                 self.broadcast_append_entries().await;
                             },
                             ClientCmdState::Pending => {
-                                // TODO: Don't really know what to do here, update 
-                                // reply_to for given sequence_num??
+                                // We add another reply_to for cmd with this seqNum.
+                                // When this cmd will be committed we will send 
+                                // responses to all appended reply_to
+                                self.state.volatile.leader_state.
+                                    append_new_reply_to_for_pending_cmd(
+                                        client_id, 
+                                        msg.reply_to, 
+                                        sequence_num
+                                );
                             },
                             ClientCmdState::Committed => {
                                 // We immediately return result.
                                 let res = self.state.volatile.leader_state
-                                    .get_committed_cmd_result(sequence_num, client_id);
+                                    .get_committed_cmd_result(
+                                        sequence_num, 
+                                        client_id
+                                );
                                 let response_args = CommandResponseArgs { 
                                             client_id, 
                                             sequence_num, 
@@ -1106,8 +1155,6 @@ impl Handler<ClientRequest> for Raft
                                                     output: res.clone()
                                 }};
 
-                                // TODO: if channel closed we probably shouldn't do anything, since deleteing client session will be done
-                                // in different way
                                 let _ = msg.reply_to.send(
                                     ClientRequestResponse::CommandResponse(
                                         response_args
@@ -1126,7 +1173,6 @@ impl Handler<ClientRequest> for Raft
                         unimplemented!("Handler<ClientRequest>:: Leader - RemoveServer unimplemented");
                     },
                     ClientRequestContent::RegisterClient => {
-                        let client_id = Uuid::new_v4();
                         let log_content = LogEntryContent::RegisterClient; 
                         let log_entry = LogEntry {
                             content: log_content,
@@ -1142,7 +1188,6 @@ impl Handler<ClientRequest> for Raft
                         self.state.volatile
                             .leader_state.insert_new_other_cmd(
                                 command_index,
-                                OtherCommandData::RegisterClient { client_id }, 
                                 msg.reply_to,
                             );
                         self.broadcast_append_entries().await;
@@ -1319,4 +1364,13 @@ fn find_new_commit_index(
         }
     }
     return commit_index;
+}
+
+fn uuid_from_log_index(log_index: IndexT) -> Uuid 
+{
+    let mut bytes = [0u8; 16];
+
+    bytes[..std::mem::size_of::<IndexT>()].copy_from_slice(&log_index.to_be_bytes());
+
+    return Uuid::from_bytes(bytes);
 }

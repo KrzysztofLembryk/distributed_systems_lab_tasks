@@ -284,9 +284,14 @@ pub struct InstallSnapshotArgs {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClientSession 
 {
+    // session’s last activity time is the timestamp of the most recently committed 
+    // log entry with this session’s client identifier
+    // When committing a log entry, you should expire sessions before you update the 
+    // last activity time
     pub last_activity: Timestamp,
     // SequenceT = u64;
     pub responses: HashMap<u64, Vec<u8>>,
+    // 
     pub lowest_sequence_num_without_response: u64,
 }
 
@@ -302,9 +307,19 @@ impl ClientSession
             lowest_sequence_num_without_response 
         };
     }
+
     pub fn contains_committed_cmd(&self, seq_num: &u64) -> bool
     {
         return self.responses.contains_key(&seq_num);
+    }
+
+    pub fn check_if_cmd_already_discarder(&self, seq_num: &u64) -> bool
+    {
+        // With each request, the client includes the lowest sequence
+        // number for which it has not yet received a response, and the state 
+        // machine then discards all responses
+        // for lower sequence numbers
+        return *seq_num < self.lowest_sequence_num_without_response;
     }
 }
 

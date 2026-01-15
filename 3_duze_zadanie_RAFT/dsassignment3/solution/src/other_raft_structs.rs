@@ -86,6 +86,8 @@ impl VolatileState
 
 pub enum ClientCmdState
 {
+    NoClientSession,
+    AlreadyDiscarded,
     NotPresent,
     Pending,
     Committed,
@@ -105,9 +107,9 @@ pub struct VolatileLeaderState
     pub client_session: HashMap<ClientIdT, ClientSessionData>,
     // When we get request from client that is NOT COMMAND we also need to store 
     // channel to which we respond, and index of this command in our log
-    pub index_to_other_cmd: HashMap<
+    pub index_to_other_cmd_reply: HashMap<
         IndexT, 
-        (UnboundedSender<ClientRequestResponse>, OtherCommandData)
+        UnboundedSender<ClientRequestResponse>
     >,
 }
 
@@ -136,8 +138,28 @@ impl VolatileLeaderState
             next_index, 
             match_index,
             client_session: HashMap::new(),
-            index_to_other_cmd: HashMap::new(),
+            index_to_other_cmd_reply: HashMap::new(),
         };
+    }
+
+    pub fn add_new_client_session(
+        &mut self, 
+        client_id: ClientIdT, 
+        client_last_activity: Timestamp,
+    )
+    {
+        let lowest_sequence_num_without_response = 0;
+
+        self.client_session.insert(
+            client_id, 
+            ClientSessionData { 
+                session: ClientSession::new(
+                    client_last_activity,
+                    lowest_sequence_num_without_response
+                ),
+                reply_to: HashMap::new(), 
+                pending_cmds: HashSet::new()
+        });
     }
 
     pub fn reinitialize(&mut self, 
@@ -158,8 +180,8 @@ impl VolatileLeaderState
         }
 
         // TODO: Do we clear these?
-        self.client_session.clear();
-        self.index_to_other_cmd.clear();
+        // self.client_session.clear();
+        // self.index_to_other_cmd_reply.clear();
     }
 
     pub fn state_of_cmd_with_sequence_num(
@@ -173,7 +195,9 @@ impl VolatileLeaderState
             let is_pending = 
                 c_session.pending_cmds.contains(&command_sequence_num);
             let is_committed = 
-                c_session.session.contains_committed_cmd(&command_sequence_num);
+                c_session.contains_committed_cmd(&command_sequence_num);
+            let is_already_discarded = 
+                c_session.check_if_cmd_already_discarded(&command_sequence_num);
 
             if is_pending && is_committed
             {
@@ -190,12 +214,19 @@ impl VolatileLeaderState
             {
                 return ClientCmdState::Committed;
             }
+            else if is_already_discarded
+            {
+                return ClientCmdState::AlreadyDiscarded;
+            }
             else
             {
                 return ClientCmdState::NotPresent;
             }
         }
-        return ClientCmdState::NotPresent;
+        else
+        {
+            return ClientCmdState::NoClientSession;
+        }
     }
 
     /// This function should be used only after checking the state of command with
@@ -223,7 +254,9 @@ impl VolatileLeaderState
         }
     }
 
-    pub fn move_from_pending_to_executed(
+    /// Function checks timestamps and session expiration, discards command results
+    /// with seq_num < lowest_sequence_num_without_response
+    pub fn move_from_pending_to_committed(
         &mut self,
         command_sequence_num: SequenceNumT,
         client_id: ClientIdT,
@@ -231,7 +264,36 @@ impl VolatileLeaderState
         lowest_sequence_num_without_response: u64,
     )
     {
+        // A session’s last activity time is the timestamp of the most recently 
+        // committed log entry with this session’s client identifier. 
+        // When committing a log entry, you should expire sessions before you update 
+        // the last activity time.
         unimplemented!("Implement me");
+    }
+
+    pub fn append_new_reply_to_for_pending_cmd(
+        &mut self,
+        client_id: ClientIdT,
+        reply_to: UnboundedSender<ClientRequestResponse>,
+        command_sequence_num: SequenceNumT,
+    )
+    {
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            if let Some(replies_vec) = 
+                c_session.reply_to.get_mut(&command_sequence_num)
+            {
+                replies_vec.push(reply_to);
+            }     
+            else
+            {
+                panic!("VolatileLeaderState::append_new_reply_to_for_pending_cmd:: there is no reply_to vector for client: '{}', but we want to append new reply_to for command: '{}'", client_id, command_sequence_num);
+            }
+        }
+        else
+        {
+            panic!("VolatileLeaderState::append_new_reply_to_for_pending_cmd:: there is no session for client: '{}', but we want to append new reply_to for command: '{}'", client_id, command_sequence_num);
+        }
     }
 
     pub fn insert_new_statemachine_pending_cmd(
@@ -239,46 +301,50 @@ impl VolatileLeaderState
         client_id: ClientIdT,
         reply_to: UnboundedSender<ClientRequestResponse>,
         command_sequence_num: SequenceNumT,
-        lowest_sequence_num_without_response: u64,
-        client_last_activity: Duration
     )
     {
         if let Some(c_session) = self.client_session.get_mut(&client_id)
         {
-            // TODO: here we probably should check timestamp or sth like this
-            // maybe update lowest_sequence_num_without_response !!!!!
-            c_session.reply_to.insert(command_sequence_num, reply_to);
+            c_session.reply_to.insert(command_sequence_num, vec![reply_to]);
             c_session.pending_cmds.insert(command_sequence_num);
         }
         else
         {
-            self.client_session.insert(
-                client_id, 
-                ClientSessionData { 
-                    session: ClientSession::new(
-                        client_last_activity,
-                        lowest_sequence_num_without_response
-                    ),
-                    reply_to: HashMap::from([(command_sequence_num, reply_to)]), 
-                    pending_cmds: HashSet::from([command_sequence_num])
-            });
+            panic!("VolatileLeaderState::insert_new_statemachine_pending_cmd:: there is no session for client: '{}', but we want to add pending cmd: '{}' for him", client_id, command_sequence_num);
         }
     }
 
     pub fn insert_new_other_cmd(
         &mut self,
         command_index: IndexT,
-        cmd: OtherCommandData,
         reply_to: UnboundedSender<ClientRequestResponse>,
     )
     {
         assert!(
-            self.index_to_other_cmd.contains_key(&command_index), 
+            self.index_to_other_cmd_reply.contains_key(&command_index), 
             "In VolatileLeaderState.index_to_other_cmd, index: '{}' already exists", command_index
         );
 
-        self.index_to_other_cmd.insert(command_index, (reply_to, cmd));
+        self.index_to_other_cmd_reply.insert(command_index, reply_to);
     }
+
+    /// Once we reply to other cmd we remove reply_to channel from our state
+    pub fn reply_to_other_cmd(
+        &mut self,
+        command_index: IndexT,
+        response: ClientRequestResponse
+    )
+    {
+        if let Some(reply_to) = self.index_to_other_cmd_reply.remove(&command_index)
+        {
+            let _ = reply_to.send(response);
+        }
+        else
+        {
+            panic!("VolatileLeaderState::reply_to_other_cmd:: there is no command with idx: '{}' in index_to_other_cmd_reply", command_index);
+        }
+    }
+
 }
 
 /// In client session we store only ClientRequest::Command results and their 
@@ -286,15 +352,35 @@ impl VolatileLeaderState
 pub struct ClientSessionData
 {
     // In session we store last activity timestamp, responses for give seqNum
-    // and lowest_sequence_num_without_response
+    // and lowest_sequence_num_without_response.
+    // We do not remove clientIds from session, once its there it stays there,
+    // however if client sends msg with too old seqNum we return SESSION EXPIRED
     pub session: ClientSession,
-    // For given SeqNum with client request we got channel to send back result
-    pub reply_to: HashMap<SequenceNumT, UnboundedSender<ClientRequestResponse>>,
+    // For given SeqNum with client request we have a vector of channels we reply to
+    // when command is committed. We need vector since while given command is pending
+    // client may send many requests with the same sequence number, so we want to 
+    // reply to all of them once entry is committed
+    pub reply_to: HashMap<SequenceNumT, Vec<UnboundedSender<ClientRequestResponse>>>,
     // Pending, meaning not committed client requests so that we can easily check
     // for duplicate requests
     pub pending_cmds: HashSet<SequenceNumT>,
 }
 
+impl ClientSessionData
+{
+    pub fn contains_committed_cmd(&self, seq_num: &u64) -> bool
+    {
+        return self.session.responses.contains_key(&seq_num);
+    }
+
+    pub fn check_if_cmd_already_discarded(&self, seq_num: &u64) -> bool
+    {
+        // With each request, the client includes the lowest sequence
+        // number for which it has not yet received a response, and the state 
+        // machine then discards all responses for lower sequence numbers
+        return *seq_num < self.session.lowest_sequence_num_without_response;
+    }
+}
 
 
 pub enum OtherCommandData {
