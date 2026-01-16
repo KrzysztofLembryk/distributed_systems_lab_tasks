@@ -70,6 +70,8 @@ pub struct VolatileState
     // VoteRequests
     pub last_hearing_from_leader_timer: Option<Instant>,
 
+    pub client_session: HashMap<ClientIdT, ClientSession>,
+
     // -----------------------------------------------------------------------------
     //      LEADER volatile state, it's ALWAYS REINITIALIZED after election
     // -----------------------------------------------------------------------------
@@ -87,83 +89,9 @@ impl VolatileState
             last_applied: 0, 
             leader_id: None,
             last_hearing_from_leader_timer: None,
+            client_session: HashMap::new(),
             leader_state: VolatileLeaderState::new(server_ids) 
         };
-    }
-}
-
-pub enum ClientCmdState
-{
-    SessionExpired,
-    NoClientSession,
-    AlreadyDiscarded,
-    WrongLowestSeqNumVal,
-    CmdResultAlreadyPresent(Vec<u8>),
-    CanBeApplied,
-}
-
-pub struct VolatileLeaderState
-{
-    pub successful_heartbeat_round_happened: bool,
-    pub responses_from_followers: HashSet<ServerIdT>,
-    // for each server it stores index of the NEXT LOG entry to send to that server,
-    // (initialized to leader last log index + 1)
-    pub next_index: HashMap<ServerIdT, IndexT>,
-    // for each server, index of highest log entry known to be replicated on server
-    // (initialized to 0, increases monotically)
-    pub match_index: HashMap<ServerIdT, IndexT>,
-
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
-    // TODO: client_session should be moved from LeaderState to just VolatileState
-    pub client_session: HashMap<ClientIdT, ClientSession>,
-    // !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!! 
-
-    // Only leader should have reply_channels, but all servers have session
-    // When we get request from client we also need to store channel to which we 
-    // respond, and index of this command in our log
-    pub reply_channels: HashMap<
-        IndexT, 
-        UnboundedSender<ClientRequestResponse>
-    >,
-}
-
-impl VolatileLeaderState
-{
-    pub fn new(
-        server_ids: &HashSet<ServerIdT>
-    ) -> VolatileLeaderState
-    {
-        let mut next_index: HashMap<ServerIdT, IndexT> = HashMap::new();
-        let mut match_index: HashMap<ServerIdT, IndexT> = HashMap::new();
-        let responses_from_followers: HashSet<ServerIdT> = HashSet::new();
-
-        for server_id in server_ids
-        {
-            // after election both of these hashmaps will be reinitialized, thus it 
-            // doesn't matter what values we put here now, but we want all server_ids
-            // to be present
-            next_index.insert(*server_id, 0);
-            match_index.insert(*server_id, 0);
-        }
-
-        return VolatileLeaderState { 
-            successful_heartbeat_round_happened: false, 
-            responses_from_followers, 
-            next_index, 
-            match_index,
-            client_session: HashMap::new(),
-            reply_channels: HashMap::new(),
-        };
-    }
-
-    pub fn insert_reply_channel(
-        &mut self, 
-        cmd_index: IndexT, 
-        reply_to: UnboundedSender<ClientRequestResponse>
-    )
-    {
-        // cmd_indexes are UNIQUE, so we safely insert new reply_to
-        self.reply_channels.insert(cmd_index, reply_to);
     }
 
     pub fn add_new_client_session(
@@ -181,28 +109,6 @@ impl VolatileLeaderState
                 lowest_sequence_num_without_response
             ),
         );
-    }
-
-    pub fn reinitialize(&mut self, 
-        server_ids: &HashSet<ServerIdT>,
-        next_index_val: IndexT
-    )
-    {
-        self.successful_heartbeat_round_happened = false;
-        self.responses_from_followers.clear(); 
-
-        self.next_index.clear();
-        self.match_index.clear();
-
-        for server_id in server_ids
-        {
-            self.next_index.insert(*server_id, next_index_val);
-            self.match_index.insert(*server_id, 0);
-        }
-        // We must clear reply_channels both here and WHEN STEPPING DOWN AS LEADER
-        // since if we don't do that someone who is NOT A LEADER may send msg to 
-        // client, we don't want that!!!!!
-        self.reply_channels.clear();
     }
 
     pub fn check_if_cmd_can_be_applied(
@@ -352,23 +258,6 @@ impl VolatileLeaderState
         }
     }
 
-    /// Once we reply to cmd we remove reply_to channel from our state
-    pub fn reply_to_client(
-        &mut self,
-        command_index: IndexT,
-        response: ClientRequestResponse
-    )
-    {
-        if let Some(reply_to) = self.reply_channels.remove(&command_index)
-        {
-            let _ = reply_to.send(response); 
-        }
-        // Otherwise we do nothing, if leader doesn't have reply_to channel it must 
-        // mean that leader has changed, and new leader has just committed old 
-        // leader's entry, and new leader doesn't know client's channels.
-        // Or if we are not a leader at all we don't reply
-    }
-
     pub fn find_and_expire_sessions(
         &mut self, 
         curr_timestamp: Timestamp, 
@@ -394,6 +283,106 @@ impl VolatileLeaderState
             self.client_session.remove(&client_id);
         }
     }
+
+}
+
+
+
+pub struct VolatileLeaderState
+{
+    pub successful_heartbeat_round_happened: bool,
+    pub responses_from_followers: HashSet<ServerIdT>,
+    // for each server it stores index of the NEXT LOG entry to send to that server,
+    // (initialized to leader last log index + 1)
+    pub next_index: HashMap<ServerIdT, IndexT>,
+    // for each server, index of highest log entry known to be replicated on server
+    // (initialized to 0, increases monotically)
+    pub match_index: HashMap<ServerIdT, IndexT>,
+
+    // Only leader should have reply_channels, but all servers have session
+    pub reply_channels: HashMap<
+        IndexT, 
+        UnboundedSender<ClientRequestResponse>
+    >,
+}
+
+impl VolatileLeaderState
+{
+    pub fn new(
+        server_ids: &HashSet<ServerIdT>
+    ) -> VolatileLeaderState
+    {
+        let mut next_index: HashMap<ServerIdT, IndexT> = HashMap::new();
+        let mut match_index: HashMap<ServerIdT, IndexT> = HashMap::new();
+        let responses_from_followers: HashSet<ServerIdT> = HashSet::new();
+
+        for server_id in server_ids
+        {
+            // after election both of these hashmaps will be reinitialized, thus it 
+            // doesn't matter what values we put here now, but we want all server_ids
+            // to be present
+            next_index.insert(*server_id, 0);
+            match_index.insert(*server_id, 0);
+        }
+
+        return VolatileLeaderState { 
+            successful_heartbeat_round_happened: false, 
+            responses_from_followers, 
+            next_index, 
+            match_index,
+            reply_channels: HashMap::new(),
+        };
+    }
+
+    pub fn reinitialize(&mut self, 
+        server_ids: &HashSet<ServerIdT>,
+        next_index_val: IndexT
+    )
+    {
+        self.successful_heartbeat_round_happened = false;
+        self.responses_from_followers.clear(); 
+
+        self.next_index.clear();
+        self.match_index.clear();
+
+        for server_id in server_ids
+        {
+            self.next_index.insert(*server_id, next_index_val);
+            self.match_index.insert(*server_id, 0);
+        }
+        // We must clear reply_channels both here and WHEN STEPPING DOWN AS LEADER
+        // since if we don't do that someone who is NOT A LEADER may send msg to 
+        // client, we don't want that!!!!!
+        self.reply_channels.clear();
+    }
+
+    pub fn insert_reply_channel(
+        &mut self, 
+        cmd_index: IndexT, 
+        reply_to: UnboundedSender<ClientRequestResponse>
+    )
+    {
+        // cmd_indexes are UNIQUE, so we safely insert new reply_to
+        self.reply_channels.insert(cmd_index, reply_to);
+    }
+
+    /// Once we reply to cmd we remove reply_to channel from our state
+    pub fn reply_to_client(
+        &mut self,
+        command_index: IndexT,
+        response: ClientRequestResponse
+    )
+    {
+        if let Some(reply_to) = self.reply_channels.remove(&command_index)
+        {
+            let _ = reply_to.send(response); 
+        }
+        // Otherwise we do nothing, if leader doesn't have reply_to channel it must 
+        // mean that leader has changed, and new leader has just committed old 
+        // leader's entry, and new leader doesn't know client's channels.
+        // Or if we are not a leader at all we don't reply
+    }
+
 }
 
 #[derive(Clone)]
@@ -423,4 +412,14 @@ fn session_expired(
         return true;
     }
     return false;
+}
+
+pub enum ClientCmdState
+{
+    SessionExpired,
+    NoClientSession,
+    AlreadyDiscarded,
+    WrongLowestSeqNumVal,
+    CmdResultAlreadyPresent(Vec<u8>),
+    CanBeApplied,
 }

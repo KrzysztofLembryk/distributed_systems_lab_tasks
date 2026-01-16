@@ -338,7 +338,7 @@ impl Raft {
                 // find and expire all sessions if they need to be expired.
                 // Otherwise we could have a client session than we would get only
                 // wrong cmds and we would never expire this client's session
-                self.state.volatile.leader_state
+                self.state.volatile
                     .find_and_expire_sessions(
                         log_entry.timestamp, 
                         self.config.session_expiration
@@ -352,7 +352,7 @@ impl Raft {
                         sequence_num, 
                         lowest_sequence_num_without_response
                     } => {
-                        match self.state.volatile.leader_state.
+                        match self.state.volatile.
                             check_if_cmd_can_be_applied(
                                *sequence_num, 
                                *lowest_sequence_num_without_response,
@@ -372,6 +372,10 @@ impl Raft {
                                 };
                                 let response = ClientRequestResponse
                                     ::CommandResponse(args);
+                                // TODO: We can add here match that checks if we are 
+                                // leader or pass our role to reply_to_client.
+                                // This way we would ensure that no other server 
+                                // replies to clients (we always clear reply_channels variable when leader is stepping down, but this way we would be even more sure, and less bug prone)
                                 self.state.volatile.leader_state
                                     .reply_to_client(curr_cmd_index, response);
                             },
@@ -381,7 +385,7 @@ impl Raft {
                                 // need to update ClientSession last activity since
                                 // even though wrong/discarded, these commands are
                                 // committed.
-                                self.state.volatile.leader_state
+                                self.state.volatile
                                     .update_client_last_activity(
                                         *client_id, 
                                         log_entry.timestamp
@@ -408,12 +412,12 @@ impl Raft {
                                 // still committed, we just don't apply its data to
                                 // our state machine, so we need to update client
                                 // last_activity and lowest_seq_num
-                                self.state.volatile.leader_state
+                                self.state.volatile
                                     .update_client_last_activity(
                                         *client_id, 
                                         log_entry.timestamp
                                 );
-                                self.state.volatile.leader_state
+                                self.state.volatile
                                     .update_client_lowest_seq_num_without_resp(
                                         *client_id, 
                                         *lowest_sequence_num_without_response
@@ -436,7 +440,7 @@ impl Raft {
                             ClientCmdState::CanBeApplied => {
                                 let result = self.state_machine.apply(data).await;
 
-                                self.state.volatile.leader_state
+                                self.state.volatile
                                     .update_client_session(
                                         *client_id, 
                                         *sequence_num, 
@@ -472,7 +476,7 @@ impl Raft {
                         // Uuid.
                         let client_id = uuid_from_log_index(curr_cmd_index);
 
-                        self.state.volatile.leader_state
+                        self.state.volatile
                             .add_new_client_session(client_id, log_entry.timestamp);
 
                         match self.role
