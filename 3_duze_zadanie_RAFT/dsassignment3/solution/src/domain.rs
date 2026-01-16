@@ -313,7 +313,7 @@ impl ClientSession
         return self.responses.contains_key(&seq_num);
     }
 
-    pub fn check_if_cmd_already_discarder(&self, seq_num: &u64) -> bool
+    pub fn check_if_cmd_already_discarded(&self, seq_num: &u64) -> bool
     {
         // With each request, the client includes the lowest sequence
         // number for which it has not yet received a response, and the state 

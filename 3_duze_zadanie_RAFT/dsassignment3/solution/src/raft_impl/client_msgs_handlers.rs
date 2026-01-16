@@ -23,26 +23,10 @@ impl Raft
                 match self.state.volatile.leader_state
                     .state_of_cmd_with_sequence_num(sequence_num, client_id)
                 {
-                    ClientCmdState::NoClientSession => {
-                        // Client doesn't have session so we reply 
-                        // SessionExpired - he should send RegisterClient 
-                        // request first
-                        let args = CommandResponseArgs {
-                            client_id,
-                            sequence_num,
-                            content: CommandResponseContent::SessionExpired
-                        };
-
-                        let _ = reply_to.send(
-                            ClientRequestResponse::CommandResponse(args)
-                        );
-                    },
                     ClientCmdState::AlreadyDiscarded => {
                         // Client asks for result of CMD that is already 
                         // discarded thus we return session expired,
                         // since correctly working client won't do that
-                        // TODO: should we end client's session if we get
-                        // such command from him?
                         let args = CommandResponseArgs {
                             client_id,
                             sequence_num,
@@ -53,7 +37,32 @@ impl Raft
                             ClientRequestResponse::CommandResponse(args)
                         );
                     },
-                    ClientCmdState::NotPresent => {
+                    ClientCmdState::NotPresent | ClientCmdState::NoClientSession => {
+                        // we will check this when command committed
+                        // if lowest_sequence_num_without_response > sequence_num
+                        // {
+                        //     // Request satisfying above condition is a PROTOCOL 
+                        //     // VIOLATION (malicious client). We send SessionExpired 
+                        //     // for this request, since we DON'T WANT TO POISON OUR 
+                        //     // LOG with it. We don't have means to tell other 
+                        //     // servers to remove such client session since to do 
+                        //     // that we would need to append ClientCommand to our log,
+                        //     // with big enough duration, but this command would have 
+                        //     // been applied to our StateMachine and we don't want 
+                        //     // that.
+
+                        //     let args = CommandResponseArgs {
+                        //         client_id,
+                        //         sequence_num,
+                        //         content: CommandResponseContent::SessionExpired
+                        //     };
+
+                        //     let _ = reply_to.send(
+                        //         ClientRequestResponse::CommandResponse(args)
+                        //     );
+                        //     return;
+                        // }
+
                         // We add new entry to log, and only when commit 
                         // we check timestamp, change 
                         // lowest_seq_nbr before etc.

@@ -344,7 +344,14 @@ impl Raft {
                                *sequence_num, 
                                *client_id, 
                                &result, 
-                               *lowest_sequence_num_without_response
+                               *lowest_sequence_num_without_response,
+                               log_entry.timestamp,
+                               self.config.session_expiration
+                        );
+                        self.state.volatile.leader_state
+                            .send_replies_for_committed_command(
+                                *sequence_num, 
+                                *client_id
                         );
                     },
                     LogEntryContent::NoOp => {
@@ -359,15 +366,14 @@ impl Raft {
                         // this index, thus based on this index value we can create
                         // Uuid
                         let client_id = uuid_from_log_index(curr_cmd_index);
-                        let client_last_activity = self.get_current_timestamp();
 
                         self.state.volatile.leader_state
-                            .add_new_client_session(client_id, client_last_activity);
+                            .add_new_client_session(client_id, log_entry.timestamp);
 
                         match self.role
                         {
                             ServerType::Leader => {
-                                // Only leader responds to client
+                                // Only leader responds to client. 
                                 self.state.volatile.leader_state.reply_to_other_cmd(
                                     curr_cmd_index, 
                                     ClientRequestResponse::RegisterClientResponse(
@@ -405,6 +411,8 @@ impl Handler<Init> for Raft
 }
 
 
+// This should be moved to raft_impl/internal_msgs_handlers, but I don't want to 
+// change provided lib.rs file so much
 #[async_trait::async_trait]
 impl Handler<RaftMessage> for Raft 
 {
@@ -448,6 +456,8 @@ impl Handler<RaftMessage> for Raft
     }
 }
 
+// This should be moved to raft_impl/client_msgs_handlers, but I don't want to change
+// provided lib.rs file so much
 #[async_trait::async_trait]
 impl Handler<ClientRequest> for Raft 
 {

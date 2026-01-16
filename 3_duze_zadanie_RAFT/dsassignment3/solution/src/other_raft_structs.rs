@@ -180,7 +180,6 @@ impl VolatileLeaderState
         }
 
         // TODO: Do we clear these?
-        // self.client_session.clear();
         // self.index_to_other_cmd_reply.clear();
     }
 
@@ -258,17 +257,127 @@ impl VolatileLeaderState
     /// with seq_num < lowest_sequence_num_without_response
     pub fn move_from_pending_to_committed(
         &mut self,
-        command_sequence_num: SequenceNumT,
+        cmd_seq_num: SequenceNumT,
         client_id: ClientIdT,
         res_data: &Vec<u8>,
-        lowest_sequence_num_without_response: u64,
+        pending_lowest_seq_num_without_resp: u64,
+        pending_entry_timestamp: Timestamp,
+        session_expiration: Duration
     )
     {
-        // A session’s last activity time is the timestamp of the most recently 
-        // committed log entry with this session’s client identifier. 
-        // When committing a log entry, you should expire sessions before you update 
-        // the last activity time.
-        unimplemented!("Implement me");
+        // 1) move from pending to committed
+        // 1.5) discard all results with seq_num < current lowest_seq
+        // 2) update timestamps, lowest_sequence_num,
+        //  check last_activity and expire session if needed
+        // 
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            if session_expired(
+                pending_entry_timestamp, 
+                c_session.session.last_activity, 
+                session_expiration
+            )
+            {
+                self.client_session.remove(&client_id);
+                return;
+            }
+            if !c_session.pending_cmds.remove(&cmd_seq_num)
+            {
+                panic!(
+                    "VolatileLeaderState::move_from_pending_to_committed:: there is no pending command with seq num: '{}' for client: '{}', but there should be one", cmd_seq_num, client_id
+                );
+            }
+
+            // Now we know that session is still valid so we update its values
+            c_session.session.last_activity = pending_entry_timestamp;
+            // Client may send us msg with smaller lowest_seq_num than we already 
+            // have because of: 
+            //      1) Client is malicious/bugged 
+            //      2) Request reordering in the Internet etc.
+            // Therefore we don't want to end his session or anything, we just set
+            // our lowest_seq_num to the max out of both
+            c_session.session.lowest_sequence_num_without_response = 
+                std::cmp::max(
+                    pending_lowest_seq_num_without_resp, 
+                    c_session.session.lowest_sequence_num_without_response
+            );
+            c_session.session.responses.insert(cmd_seq_num, res_data.clone());
+
+            // We need to discard all saved responses with seq_num smaller than
+            // just updated lowest_sequence_num_without_response
+            self.discard_all_saved_entries_with_too_low_seq_num(client_id);
+
+        }
+        // If there isn't a session this means that it has been already expired
+        // so we don't do anything apart from applying this command to state machine
+        // but it was already done before this function
+    }
+
+    pub fn send_replies_for_committed_command(
+        &mut self,
+        cmd_seq_num: SequenceNumT,
+        client_id: ClientIdT,
+    )
+    {
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            if let Some(reply_vec) = c_session.reply_to.remove(&cmd_seq_num)
+            {
+                let response_data = c_session.session.responses
+                    .get(&cmd_seq_num)
+                    .expect(&format!("
+                        VolatileLeaderState::send_replies_for_committed_command:: for client: '{}', for command: '{}' there is no saved response in session.responses, this should never happen
+                    ", client_id, cmd_seq_num));
+
+                for reply_to in reply_vec.iter()
+                {
+                    // We don't care if client crashed, closed channel, we just send
+                    // msg and don't check if it was successful. After sending msgs
+                    // we discard these reply_to channels
+                    let _ = reply_to.send(ClientRequestResponse::CommandResponse(
+                        crate::CommandResponseArgs { 
+                            client_id, 
+                            sequence_num: cmd_seq_num, 
+                            content: crate::CommandResponseContent::CommandApplied { 
+                                output: response_data.clone()
+                            }
+                        }
+                    ));
+                }
+            }
+            // If there aren't any reply_to channels it means that we are not a 
+            // Leader, so there is nothing to send
+        }
+        // if there is no session we do nothing
+    }
+
+    fn discard_all_saved_entries_with_too_low_seq_num(
+        &mut self,
+        client_id: ClientIdT,
+    )
+    {
+        if let Some(c_session) = self.client_session.get_mut(&client_id)
+        {
+            let lowest_seq_without_resp = 
+                c_session.session.lowest_sequence_num_without_response;
+            let mut seq_num_to_discard: Vec<u64> = Vec::new();
+
+            for seq_num in c_session.session.responses.keys()
+            {
+                if *seq_num < lowest_seq_without_resp
+                {
+                    seq_num_to_discard.push(*seq_num);
+                }
+            }
+
+            for seq_num in seq_num_to_discard
+            {
+                // At this point reply_to shouldn't have any of these seq_num, but 
+                // to be sure we also remove
+                c_session.reply_to.remove(&seq_num);
+                c_session.session.responses.remove(&seq_num);
+            }
+        }
     }
 
     pub fn append_new_reply_to_for_pending_cmd(
@@ -339,10 +448,9 @@ impl VolatileLeaderState
         {
             let _ = reply_to.send(response);
         }
-        else
-        {
-            panic!("VolatileLeaderState::reply_to_other_cmd:: there is no command with idx: '{}' in index_to_other_cmd_reply", command_index);
-        }
+        // Otherwise we do nothing, if leader doesn't have reply_to channel it must 
+        // mean that leader has changed, and new leader has just committed old leader's entry, and new leader doesn't know client's channels
+        
     }
 
 }
@@ -359,7 +467,7 @@ pub struct ClientSessionData
     // For given SeqNum with client request we have a vector of channels we reply to
     // when command is committed. We need vector since while given command is pending
     // client may send many requests with the same sequence number, so we want to 
-    // reply to all of them once entry is committed
+    // reply to all of them once entry is committed, we remove them afterwards
     pub reply_to: HashMap<SequenceNumT, Vec<UnboundedSender<ClientRequestResponse>>>,
     // Pending, meaning not committed client requests so that we can easily check
     // for duplicate requests
@@ -401,4 +509,24 @@ pub enum ServerType {
         votes_received: HashSet<Uuid>,
     },
     Leader,
+}
+
+fn session_expired(
+    pending_entry_timestamp: Timestamp,
+    last_activity: Timestamp,
+    session_expiration: Duration
+) -> bool
+{
+    // A session’s last activity time is the timestamp of the most recently 
+    // committed log entry with this session’s client identifier. 
+    // When committing a log entry, you should expire sessions before you update 
+    // the last activity time.
+    if pending_entry_timestamp.abs_diff(last_activity) > session_expiration
+    {
+        // Between last committed entry and currently committed entry elapsed
+        // more time than allowed session_expiration time, thus session has expired 
+        // and we need remove this client's session from our server
+        return true;
+    }
+    return false;
 }
