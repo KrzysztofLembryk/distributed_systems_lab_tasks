@@ -257,6 +257,9 @@ impl Raft {
             // hearbeat timer, if we are not Leader stopping heartbeat_timer 
             // does nothing
             self.role = ServerType::Follower;
+            // We must clear reply_channels when changing our role, since we don't 
+            // want server that is not a leader to send msgs to clients.
+            self.state.clear_reply_channels();
             self.stop_heartbeat_timer().await;
             self.update_term(new_term).await;
         }
@@ -330,6 +333,17 @@ impl Raft {
             if let Some(log_entry) = 
                 self.state.persistent.log.get(curr_cmd_index)
             {
+                // Even if we get only malicious/wrong commands their TIMESTAMPS are
+                // correct since created by server, so first thing we do is to 
+                // find and expire all sessions if they need to be expired.
+                // Otherwise we could have a client session than we would get only
+                // wrong cmds and we would never expire this client's session
+                self.state.volatile.leader_state
+                    .find_and_expire_sessions(
+                        log_entry.timestamp, 
+                        self.config.session_expiration
+                );
+
                 match &log_entry.content
                 {
                     LogEntryContent::Command { 
@@ -338,33 +352,124 @@ impl Raft {
                         sequence_num, 
                         lowest_sequence_num_without_response
                     } => {
-                        let result = self.state_machine.apply(data).await;
-                        self.state.volatile.leader_state.
-                            move_from_pending_to_committed(
+                        match self.state.volatile.leader_state.
+                            check_if_cmd_can_be_applied(
                                *sequence_num, 
-                               *client_id, 
-                               &result, 
                                *lowest_sequence_num_without_response,
+                               *client_id, 
                                log_entry.timestamp,
                                self.config.session_expiration
-                        );
-                        self.state.volatile.leader_state
-                            .send_replies_for_committed_command(
-                                *sequence_num, 
-                                *client_id
-                        );
+                        )
+                        {
+                            ClientCmdState::NoClientSession 
+                            | ClientCmdState::SessionExpired => {
+                                // Just reply with SessionExpired, we no longer have 
+                                // session for this client
+                                let args = CommandResponseArgs {
+                                    client_id: *client_id,
+                                    sequence_num: *sequence_num,
+                                    content: CommandResponseContent::SessionExpired
+                                };
+                                let response = ClientRequestResponse
+                                    ::CommandResponse(args);
+                                self.state.volatile.leader_state
+                                    .reply_to_client(curr_cmd_index, response);
+                            },
+                            ClientCmdState::AlreadyDiscarded 
+                            | ClientCmdState::WrongLowestSeqNumVal => {
+                                // Apart from replying with SessionExpired we also
+                                // need to update ClientSession last activity since
+                                // even though wrong/discarded, these commands are
+                                // committed.
+                                self.state.volatile.leader_state
+                                    .update_client_last_activity(
+                                        *client_id, 
+                                        log_entry.timestamp
+                                );
+                                // We don't update LowestSeqNum val since in case:
+                                // AlreadyDiscarded this means that this command's
+                                // lowest_seq_num is lower than ours becaues its 
+                                // seq_num is smaller than our lowestSeqNum. If
+                                // its lowest_seq_num were bigger than ours we would
+                                // be in WrongLowestSeqNumVal case.
+
+                                let args = CommandResponseArgs {
+                                    client_id: *client_id,
+                                    sequence_num: *sequence_num,
+                                    content: CommandResponseContent::SessionExpired
+                                };
+                                let response = ClientRequestResponse
+                                    ::CommandResponse(args);
+                                self.state.volatile.leader_state
+                                    .reply_to_client(curr_cmd_index, response);
+                            }
+                            ClientCmdState::CmdResultAlreadyPresent(res_data) => {
+                                // Even though result is present this command is 
+                                // still committed, we just don't apply its data to
+                                // our state machine, so we need to update client
+                                // last_activity and lowest_seq_num
+                                self.state.volatile.leader_state
+                                    .update_client_last_activity(
+                                        *client_id, 
+                                        log_entry.timestamp
+                                );
+                                self.state.volatile.leader_state
+                                    .update_client_lowest_seq_num_without_resp(
+                                        *client_id, 
+                                        *lowest_sequence_num_without_response
+                                );
+
+                                let content = 
+                                    CommandResponseContent::CommandApplied { 
+                                            output: res_data
+                                };
+                                let response = 
+                                    ClientRequestResponse::CommandResponse(
+                                        CommandResponseArgs { 
+                                            client_id: *client_id, 
+                                            sequence_num: *sequence_num, 
+                                            content 
+                                });
+                                self.state.volatile.leader_state
+                                    .reply_to_client(curr_cmd_index, response);
+                            }
+                            ClientCmdState::CanBeApplied => {
+                                let result = self.state_machine.apply(data).await;
+
+                                self.state.volatile.leader_state
+                                    .update_client_session(
+                                        *client_id, 
+                                        *sequence_num, 
+                                        *lowest_sequence_num_without_response, 
+                                        log_entry.timestamp, 
+                                        &result
+                                );
+                                let content = 
+                                    CommandResponseContent::CommandApplied { 
+                                            output: result
+                                };
+                                let response = 
+                                    ClientRequestResponse::CommandResponse(
+                                        CommandResponseArgs { 
+                                            client_id: *client_id, 
+                                            sequence_num: *sequence_num, 
+                                            content 
+                                });
+                                self.state.volatile.leader_state
+                                    .reply_to_client(curr_cmd_index, response);
+                            },
+                        }
                     },
                     LogEntryContent::NoOp => {
-                        // doing nothing
+                        // we do nothing
                     },
                     LogEntryContent::Configuration { .. } => {
-
                     },
                     LogEntryContent::RegisterClient => {
                         // Log index for given command is unique, and if command is
                         // committed all servers will have this very command for 
                         // this index, thus based on this index value we can create
-                        // Uuid
+                        // Uuid.
                         let client_id = uuid_from_log_index(curr_cmd_index);
 
                         self.state.volatile.leader_state
@@ -374,7 +479,7 @@ impl Raft {
                         {
                             ServerType::Leader => {
                                 // Only leader responds to client. 
-                                self.state.volatile.leader_state.reply_to_other_cmd(
+                                self.state.volatile.leader_state.reply_to_client(
                                     curr_cmd_index, 
                                     ClientRequestResponse::RegisterClientResponse(
                                         RegisterClientResponseArgs {

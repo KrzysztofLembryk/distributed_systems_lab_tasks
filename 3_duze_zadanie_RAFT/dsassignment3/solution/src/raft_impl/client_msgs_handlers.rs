@@ -4,7 +4,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::domain::*;
 use crate::{Raft};
 use crate::types_defs::{SequenceNumT};
-use crate::other_raft_structs::{ClientCmdState, ServerType};
+use crate::other_raft_structs::{ServerType};
 
 impl Raft
 {
@@ -20,109 +20,34 @@ impl Raft
         match self.role
         {
             ServerType::Leader => {
-                match self.state.volatile.leader_state
-                    .state_of_cmd_with_sequence_num(sequence_num, client_id)
-                {
-                    ClientCmdState::AlreadyDiscarded => {
-                        // Client asks for result of CMD that is already 
-                        // discarded thus we return session expired,
-                        // since correctly working client won't do that
-                        let args = CommandResponseArgs {
-                            client_id,
-                            sequence_num,
-                            content: CommandResponseContent::SessionExpired
-                        };
+                // We append every command, and only when committing we either skip
+                // this command or do other stuff
+                let client_last_activity_timestamp = 
+                    self.get_current_timestamp();
 
-                        let _ = reply_to.send(
-                            ClientRequestResponse::CommandResponse(args)
-                        );
-                    },
-                    ClientCmdState::NotPresent | ClientCmdState::NoClientSession => {
-                        // we will check this when command committed
-                        // if lowest_sequence_num_without_response > sequence_num
-                        // {
-                        //     // Request satisfying above condition is a PROTOCOL 
-                        //     // VIOLATION (malicious client). We send SessionExpired 
-                        //     // for this request, since we DON'T WANT TO POISON OUR 
-                        //     // LOG with it. We don't have means to tell other 
-                        //     // servers to remove such client session since to do 
-                        //     // that we would need to append ClientCommand to our log,
-                        //     // with big enough duration, but this command would have 
-                        //     // been applied to our StateMachine and we don't want 
-                        //     // that.
+                let log_content = LogEntryContent::Command { 
+                    data: command.clone(), 
+                    client_id, 
+                    sequence_num, 
+                    lowest_sequence_num_without_response 
+                };
+                let log_entry = LogEntry {
+                    content: log_content,
+                    term: self.state.persistent.current_term,
+                    timestamp: client_last_activity_timestamp
+                };
 
-                        //     let args = CommandResponseArgs {
-                        //         client_id,
-                        //         sequence_num,
-                        //         content: CommandResponseContent::SessionExpired
-                        //     };
+                self.state.persistent.log.push(log_entry);
+                self.save_to_stable_storage().await;
 
-                        //     let _ = reply_to.send(
-                        //         ClientRequestResponse::CommandResponse(args)
-                        //     );
-                        //     return;
-                        // }
+                let cmd_index = self.state.persistent.log.len() - 1;
+                self.state.volatile.leader_state.insert_reply_channel(
+                    cmd_index, 
+                    reply_to
+                );
 
-                        // We add new entry to log, and only when commit 
-                        // we check timestamp, change 
-                        // lowest_seq_nbr before etc.
-                        let client_last_activity_timestamp = 
-                            self.get_current_timestamp();
+                self.broadcast_append_entries().await;
 
-                        let log_content = LogEntryContent::Command { 
-                            data: command.clone(), 
-                            client_id, 
-                            sequence_num, 
-                            lowest_sequence_num_without_response 
-                        };
-                        let log_entry = LogEntry {
-                            content: log_content,
-                            term: self.state.persistent.current_term,
-                            timestamp: client_last_activity_timestamp
-                        };
-
-                        self.state.persistent.log.push(log_entry);
-                        self.save_to_stable_storage().await;
-                        self.state.volatile.leader_state
-                            .insert_new_statemachine_pending_cmd(
-                                client_id,
-                                reply_to,
-                                sequence_num,
-                            );
-                        self.broadcast_append_entries().await;
-                    },
-                    ClientCmdState::Pending => {
-                        // We add another reply_to for cmd with this seqNum.
-                        // When this cmd will be committed we will send 
-                        // responses to all appended reply_to
-                        self.state.volatile.leader_state.
-                            append_new_reply_to_for_pending_cmd(
-                                client_id, 
-                                reply_to, 
-                                sequence_num
-                        );
-                    },
-                    ClientCmdState::Committed => {
-                        // We immediately return result.
-                        let res = self.state.volatile.leader_state
-                            .get_committed_cmd_result(
-                                sequence_num, 
-                                client_id
-                        );
-                        let response_args = CommandResponseArgs { 
-                                    client_id, 
-                                    sequence_num, 
-                                    content: CommandResponseContent
-                                        ::CommandApplied { 
-                                            output: res.clone()
-                        }};
-
-                        let _ = reply_to.send(
-                            ClientRequestResponse::CommandResponse(
-                                response_args
-                        ));
-                    }
-                }
             },
             // Anyone apart from Leader rejects Client request
             _ => {
@@ -166,7 +91,7 @@ impl Raft
                 let command_index = self.state.persistent.log.len() - 1;
 
                 self.state.volatile
-                    .leader_state.insert_new_other_cmd(
+                    .leader_state.insert_reply_channel(
                         command_index,
                         reply_to,
                     );

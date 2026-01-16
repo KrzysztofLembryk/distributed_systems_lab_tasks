@@ -123,10 +123,12 @@ impl Handler<ElectionTimeout> for Raft
                 }
                 else
                 {
+                    info!("Leader {} is stepping down after no successful round of heartbeats during election timeout", self.config.self_id);
                     // We didn't have successful heartbeat round during whole 
                     // election timeout thus we revert back to Follower
                     self.role = ServerType::Follower;
                     self.state.volatile.leader_id = None;
+                    self.state.clear_reply_channels();
                     self.stop_heartbeat_timer().await;
                     self.reset_election_timer().await;
                 }

@@ -374,7 +374,7 @@ impl Raft
             {
                 ServerType::Leader => {
                     // Leader ALWAYS ignores RequestVote
-                    debug!("Leader: '{}' got RequestVote - IGNORING it", self.config.self_id);
+                    info!("Leader: '{}' got RequestVote - IGNORING it", self.config.self_id);
                 }
                 _ => {
                     // Anyone else proceeds
