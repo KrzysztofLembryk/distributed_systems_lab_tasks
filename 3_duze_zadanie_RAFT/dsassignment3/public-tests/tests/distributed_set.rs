@@ -11,10 +11,21 @@ use std::time::Duration;
 use tokio::sync::mpsc::unbounded_channel;
 use tokio::time::Instant;
 use uuid::Uuid;
+use log;
+
+fn init_logger() 
+{
+    let _ = env_logger::builder()
+        .is_test(true)
+        .filter_level(log::LevelFilter::Debug)
+        .try_init();
+}
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[timeout(100)]
-async fn can_remove_from_set() {
+async fn can_remove_from_set() 
+{
+    init_logger();
     // given
     let mut system = System::new().await;
 
@@ -123,7 +134,9 @@ async fn can_remove_from_set() {
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 #[timeout(100)]
-async fn single_node_adds_to_set() {
+async fn single_node_adds_to_set() 
+{
+    init_logger();
     // given
     let mut system = System::new().await;
 

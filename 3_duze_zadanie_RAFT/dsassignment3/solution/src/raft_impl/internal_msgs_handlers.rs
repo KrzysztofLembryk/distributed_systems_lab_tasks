@@ -30,11 +30,13 @@ impl Raft
             match &self.role
             {
                 ServerType::Follower => {
+                    debug!("Raft::handle_append_entries:: Follower: {} got appendEntries", self.config.self_id);
                     self.reset_election_timer().await;
                 },
                 ServerType::Candidate { .. } => {
                     // If we are Candidate and got AppendEntries from Leader that has
                     // 'term >= our_term' we revert back to Follower
+                    debug!("Raft::handle_append_entries:: Candidate: {} got appendEntries", self.config.self_id);
                     self.reset_election_timer().await;
                     self.role = ServerType::Follower;
                 },
@@ -65,28 +67,9 @@ impl Raft
             {
                 if prev_entry.term == prev_log_term
                 {
-                    // We want to keep only logs from 0 to prev_log_index
-                    // but truncate takes len, so there are prev_log_index + 1 elems
-                    // from 0 to prev_log_index
-                    self.state.persistent.log.truncate(prev_log_index + 1);
-                    // we append all entries
-                    self.state.persistent.log.extend_from_slice(&args.entries);
+                    debug!("Raft::handle_append_entries:: Server: '{}', has equal prevTerm to prevLogTerm: {}", self.config.self_id,prev_log_term);
 
-                    // We changed persistent state so immediately afterwards we want 
-                    // to save these changes to stable storage
-                    self.save_to_stable_storage().await;
-
-                    let leader_commit_index: usize = args.leader_commit;
-                    // In persistent state we always have at least one log, which is
-                    // config log that we add when creating RAFT server
-                    let last_new_entry_idx: usize = 
-                        self.state.persistent.log
-                            .len()
-                            .checked_sub(1)
-                            .expect("Raft::handle_append_entries:: last_new_entry_idx = state.persistent.log.len - 1 returned error, it means that len was 0, this shouldn't happen");
-
-                    self.state.volatile.commit_index = 
-                        std::cmp::min(leader_commit_index, last_new_entry_idx);
+                    self.do_appending(args, prev_log_index).await;
 
                     response_msg = 
                         self.create_append_entries_response_msg(true, args);
@@ -94,6 +77,7 @@ impl Raft
                 else
                 {
                     // 2) We have entry at prevLogIdx but not with prevLogTerm
+                    debug!("Raft::handle_append_entries:: Server: '{}', has entry at prevLogIdx {} but not with prevLogTerm: {}", self.config.self_id , prev_log_index, prev_log_term);
                     response_msg = 
                         self.create_append_entries_response_msg(false, args);
                 }
@@ -101,6 +85,7 @@ impl Raft
             else
             {
                 // 1) We don't have entry at prevLogIndex
+                debug!("Raft::handle_append_entries:: Server: '{}', doesn't have entry at prevLogIndex: {}", self.config.self_id , prev_log_index);
                 response_msg =
                     self.create_append_entries_response_msg(false, args);
             }
@@ -112,6 +97,9 @@ impl Raft
             response_msg = self.create_append_entries_response_msg(false, args);
         }
         self.msg_sender.send(&leader_id, response_msg).await;
+        // After every AppendEntries msg we got commit index might change and we 
+        // have new entries so we want to apply them now.
+        self.apply_commited_cmds_to_state_machine().await;
     }
 
     pub async fn handle_append_entries_response(
@@ -439,4 +427,33 @@ impl Raft
         };
     }
 
+    async fn do_appending(
+        &mut self, 
+        args: &AppendEntriesArgs, 
+        prev_log_index: usize
+    )
+    {
+        // We want to keep only logs from 0 to prev_log_index
+        // but truncate takes len, so there are prev_log_index + 1 elems
+        // from 0 to prev_log_index
+        self.state.persistent.log.truncate(prev_log_index + 1);
+        // we append all entries
+        self.state.persistent.log.extend_from_slice(&args.entries);
+
+        // We changed persistent state so immediately afterwards we want 
+        // to save these changes to stable storage
+        self.save_to_stable_storage().await;
+
+        let leader_commit_index: usize = args.leader_commit;
+        // In persistent state we always have at least one log, which is
+        // config log that we add when creating RAFT server
+        let last_new_entry_idx: usize = 
+            self.state.persistent.log
+                .len()
+                .checked_sub(1)
+                .expect("Raft::handle_append_entries:: last_new_entry_idx = state.persistent.log.len - 1 returned error, it means that len was 0, this shouldn't happen");
+
+        self.state.volatile.commit_index = 
+            std::cmp::min(leader_commit_index, last_new_entry_idx);
+    }
 }

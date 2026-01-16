@@ -1,7 +1,7 @@
 use module_system::{Handler, ModuleRef, System, TimerHandle};
 use other_raft_structs::{ServerType, ServerState, PersistentState};
 use uuid::Uuid;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use log::{debug, warn, info};
 
 pub use domain::*;
@@ -42,6 +42,7 @@ impl Raft {
         message_sender: Box<dyn RaftSender>,
     ) -> ModuleRef<Self> 
     {
+        debug!("Raft::new:: creating server: {}", config.self_id);
         let mut state_machine = state_machine;
         let volatile_state: VolatileState = 
             VolatileState::new(&config.servers);
@@ -322,8 +323,8 @@ impl Raft {
     /// as long as last_applied < commit_index
     async fn apply_commited_cmds_to_state_machine(&mut self)
     {
-        // TODO: we need to add responding to msgs of clients here 
         let commit_index = self.state.volatile.commit_index;
+        debug!("Raft::apply_commited_cmds_to_state_machine:: Server: {} starts applying commands to state machine, commit_index: {}", self.config.self_id, commit_index);
 
         while commit_index > self.state.volatile.last_applied
         {
@@ -519,7 +520,6 @@ impl Handler<Init> for Raft
     }
 }
 
-
 // This should be moved to raft_impl/internal_msgs_handlers, but I don't want to 
 // change provided lib.rs file so much
 #[async_trait::async_trait]
@@ -554,14 +554,6 @@ impl Handler<RaftMessage> for Raft
 
             }
         }
-
-        // TODO: change commit_index if role is LEADER
-        self.update_commit_index_if_leader();
-
-        // After handling given msg and responding, if there are log entries to apply
-        // and we haven't applied them yet we do it now, but only if we know they are
-        // COMMITTED
-        self.apply_commited_cmds_to_state_machine().await;
     }
 }
 

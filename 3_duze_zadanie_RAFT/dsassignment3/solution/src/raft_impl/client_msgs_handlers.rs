@@ -1,5 +1,6 @@
 use uuid::Uuid;
 use tokio::sync::mpsc::UnboundedSender;
+use log::{debug};
 
 use crate::domain::*;
 use crate::{Raft};
@@ -78,6 +79,7 @@ impl Raft
         match self.role
         {
             ServerType::Leader => {
+                debug!("Leader: {} got RegisterClient", self.config.self_id);
                 let log_content = LogEntryContent::RegisterClient; 
                 let log_entry = LogEntry {
                     content: log_content,
