@@ -453,205 +453,33 @@ impl Handler<ClientRequest> for Raft
 {
     async fn handle(&mut self, msg: ClientRequest) 
     {
-        match self.role
+        match msg.content
         {
-            ServerType::Leader => {
-                match msg.content
-                {
-                    ClientRequestContent::Command { 
-                        command, 
-                        client_id, 
-                        sequence_num, 
-                        lowest_sequence_num_without_response 
-                    } => {
-                        match self.state.volatile.leader_state
-                            .state_of_cmd_with_sequence_num(sequence_num, client_id)
-                        {
-                            ClientCmdState::NoClientSession => {
-                                // Client doesn't have session so we reply 
-                                // SessionExpired - he should send RegisterClient 
-                                // request first
-                                let args = CommandResponseArgs {
-                                    client_id,
-                                    sequence_num,
-                                    content: CommandResponseContent::SessionExpired
-                                };
-
-                                let _ = msg.reply_to.send(
-                                    ClientRequestResponse::CommandResponse(args)
-                                );
-                            },
-                            ClientCmdState::AlreadyDiscarded => {
-                                // Client asks for result of CMD that is already 
-                                // discarded thus we return session expired,
-                                // since correctly working client won't do that
-                                // TODO: should we end client's session if we get
-                                // such command from him?
-                                let args = CommandResponseArgs {
-                                    client_id,
-                                    sequence_num,
-                                    content: CommandResponseContent::SessionExpired
-                                };
-
-                                let _ = msg.reply_to.send(
-                                    ClientRequestResponse::CommandResponse(args)
-                                );
-                            },
-                            ClientCmdState::NotPresent => {
-                                // We add new entry to log, and wait for commit 
-                                // before checking timestamp, changing 
-                                // lowest_seq_nbr before replying.
-                                let client_last_activity_timestamp = 
-                                    self.get_current_timestamp();
-
-                                let log_content = LogEntryContent::Command { 
-                                    data: command, 
-                                    client_id, 
-                                    sequence_num, 
-                                    lowest_sequence_num_without_response 
-                                };
-                                let log_entry = LogEntry {
-                                    content: log_content,
-                                    term: self.state.persistent.current_term,
-                                    timestamp: client_last_activity_timestamp
-                                };
-
-                                self.state.persistent.log.push(log_entry);
-                                self.save_to_stable_storage().await;
-                                self.state.volatile.leader_state
-                                    .insert_new_statemachine_pending_cmd(
-                                        client_id,
-                                        msg.reply_to,
-                                        sequence_num,
-                                    );
-                                self.broadcast_append_entries().await;
-                            },
-                            ClientCmdState::Pending => {
-                                // We add another reply_to for cmd with this seqNum.
-                                // When this cmd will be committed we will send 
-                                // responses to all appended reply_to
-                                self.state.volatile.leader_state.
-                                    append_new_reply_to_for_pending_cmd(
-                                        client_id, 
-                                        msg.reply_to, 
-                                        sequence_num
-                                );
-                            },
-                            ClientCmdState::Committed => {
-                                // We immediately return result.
-                                let res = self.state.volatile.leader_state
-                                    .get_committed_cmd_result(
-                                        sequence_num, 
-                                        client_id
-                                );
-                                let response_args = CommandResponseArgs { 
-                                            client_id, 
-                                            sequence_num, 
-                                            content: CommandResponseContent
-                                                ::CommandApplied { 
-                                                    output: res.clone()
-                                }};
-
-                                let _ = msg.reply_to.send(
-                                    ClientRequestResponse::CommandResponse(
-                                        response_args
-                                ));
-                            }
-                        }
-
-                    },
-                    ClientRequestContent::Snapshot => {
-                        unimplemented!("Leader - handling Client Snapshot request not implemented");
-                    },
-                    ClientRequestContent::AddServer { new_server } => {
-                        unimplemented!("Handler<ClientRequest>:: Leader - AddServer unimplemented");
-                    },
-                    ClientRequestContent::RemoveServer { old_server } => {
-                        unimplemented!("Handler<ClientRequest>:: Leader - RemoveServer unimplemented");
-                    },
-                    ClientRequestContent::RegisterClient => {
-                        let log_content = LogEntryContent::RegisterClient; 
-                        let log_entry = LogEntry {
-                            content: log_content,
-                            term: self.state.persistent.current_term,
-                            timestamp: self.get_current_timestamp()
-                        };
-
-                        self.state.persistent.log.push(log_entry);
-                        self.save_to_stable_storage().await;
-
-                        let command_index = self.state.persistent.log.len() - 1;
-
-                        self.state.volatile
-                            .leader_state.insert_new_other_cmd(
-                                command_index,
-                                msg.reply_to,
-                            );
-                        self.broadcast_append_entries().await;
-                    }
-                }
+            ClientRequestContent::Command { 
+                command, 
+                client_id, 
+                sequence_num, 
+                lowest_sequence_num_without_response 
+            } => {
+                self.handle_client_command(
+                    &command, 
+                    client_id, 
+                    sequence_num, 
+                    lowest_sequence_num_without_response, 
+                    msg.reply_to
+                ).await;
             },
-            _ => {
-                // Anyone apart from Leader rejects Client request
-                match msg.content
-                {
-                    ClientRequestContent::Command {client_id, sequence_num, ..} => {
-                        let response_args = CommandResponseArgs {
-                            client_id,
-                            sequence_num,
-                            content: CommandResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id.clone()
-                            }
-                        };
-                        let response = ClientRequestResponse::CommandResponse(
-                            response_args
-                        );
-
-                        // We don't care if client still has channel opened or not
-                        // we just send msg
-                        let _ = msg.reply_to.send(response);
-                    },
-                    ClientRequestContent::Snapshot => {
-                        unimplemented!("Follower/Candidate - handling Client Snapshot request not implemented");
-                    },
-                    ClientRequestContent::AddServer { new_server } => {
-                        let args = AddServerResponseArgs {
-                            new_server,
-                            content: AddServerResponseContent::NotLeader {  
-                                leader_hint: self.state.volatile.leader_id.clone()
-                            }
-                        };
-                        let response = 
-                            ClientRequestResponse::AddServerResponse(args);
-
-                        let _ = msg.reply_to.send(response);
-                    },
-                    ClientRequestContent::RemoveServer { old_server } => {
-                        let args = RemoveServerResponseArgs {
-                            old_server,
-                            content: RemoveServerResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id.clone()
-                            }
-                        };
-
-                        let response = 
-                            ClientRequestResponse::RemoveServerResponse(args);
-
-                        let _ = msg.reply_to.send(response);
-                    },
-                    ClientRequestContent::RegisterClient => {
-                        let args = RegisterClientResponseArgs {
-                            content: RegisterClientResponseContent::NotLeader { 
-                                leader_hint: self.state.volatile.leader_id.clone()
-                            }
-                        };
-
-                        let response = 
-                            ClientRequestResponse::RegisterClientResponse(args);
-
-                        let _ = msg.reply_to.send(response);
-                    }
-                }
+            ClientRequestContent::Snapshot => {
+                self.handle_client_snapshot().await;
+            },
+            ClientRequestContent::AddServer { new_server } => {
+                self.handle_client_add_server(new_server, msg.reply_to).await;
+            },
+            ClientRequestContent::RemoveServer { old_server } => {
+                self.handle_client_remove_server(old_server, msg.reply_to).await;
+            },
+            ClientRequestContent::RegisterClient => {
+                self.handle_client_register(msg.reply_to).await;
             }
         }
     }
@@ -665,6 +493,7 @@ async fn recover_state_machine(
     last_applied_idx: IndexT
 )
 {
+    // When recovering we are FOLLOWER
     // Since state machine is volatile it must be recovered after restart by
     // reapplying log entries (after applying latest snapshot)
     for (idx, cmd) in persistent_state.log.iter().enumerate()
@@ -677,6 +506,7 @@ async fn recover_state_machine(
         match &cmd.content
         {
             LogEntryContent::Command { data, .. } => {
+                // TODO: here we need also to CREATE SESSIONS, add entries etc
                 let _ = state_machine.apply(data).await;
             },
             _ => {
@@ -686,6 +516,7 @@ async fn recover_state_machine(
     }
 }
 
+// TODO: test this function
 fn find_new_commit_index(
     mut commit_index: usize, 
     match_indexes: &HashMap<ServerIdT, IndexT>,

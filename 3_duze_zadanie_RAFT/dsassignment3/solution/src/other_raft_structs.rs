@@ -394,6 +394,7 @@ pub enum OtherCommandData {
     RegisterClient { client_id: ClientIdT },
 }
 
+#[derive(Clone)]
 pub enum ServerType {
     Follower,
     Candidate {
