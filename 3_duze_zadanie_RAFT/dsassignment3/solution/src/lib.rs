@@ -626,6 +626,7 @@ async fn recover_state_machine(
         {
             LogEntryContent::Command { data, .. } => {
                 // TODO: here we need also to CREATE SESSIONS, add entries etc
+                // we probably should just invoke here apply_commited_cmds_to_state_machine
                 let _ = state_machine.apply(data).await;
             },
             _ => {
