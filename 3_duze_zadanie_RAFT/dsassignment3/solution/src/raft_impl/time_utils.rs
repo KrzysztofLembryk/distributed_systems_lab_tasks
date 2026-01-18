@@ -146,6 +146,7 @@ impl Handler<ElectionTimeout> for Raft
                 if self.state.volatile
                     .leader_state.successful_heartbeat_round_happened
                 {
+                    debug!("Leader {} had successful hearbeat round", self.config.self_id);
                     // We had a successful heartbeat round so we stay as Leader
                     self.state.volatile
                         .leader_state
@@ -156,7 +157,7 @@ impl Handler<ElectionTimeout> for Raft
                 }
                 else
                 {
-                    info!("Leader {} is stepping down after no successful round of heartbeats during election timeout", self.config.self_id);
+                    info!("Leader {} STEPS DOWN after no successful round of heartbeats during election timeout", self.config.self_id);
                     // We didn't have successful heartbeat round during whole 
                     // election timeout thus we revert back to Follower
                     self.role = ServerType::Follower;

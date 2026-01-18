@@ -165,18 +165,18 @@ impl Raft {
     {
         let next_index = *self.state.volatile.leader_state.next_index
             .get(server_id)
-            .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.next_index map", server_id));
+            .expect(&format!("Raft::create_append_entries_args_for_given_server:: for server '{}' we don't have value in volatile.next_index map", server_id));
         let match_index = *self.state.volatile.leader_state.match_index
             .get(server_id)
-            .expect(&format!("Raft::broadcast_append_entries:: for server '{}' we don't have value in volatile.match_index map", server_id));
+            .expect(&format!("Raft::create_append_entries_args_for_given_server:: for server '{}' we don't have value in volatile.match_index map", server_id));
 
         let prev_log_index: IndexT = next_index
                 .checked_sub(1)
-                .expect("Raft::broadcast_append_entries:: when calculating prev_log_index, next_index.checked_sub(1) failed");
+                .expect("Raft::create_append_entries_args_for_given_server:: when calculating prev_log_index, next_index.checked_sub(1) failed");
         let prev_log_term: TermT = self.state.persistent.log
                 .get(prev_log_index)
                 .expect(
-                &format!("Raft::broadcast_append_entries:: there is no log in state.persistent.log for prev_log_index: {}", prev_log_index))
+                &format!("Raft::create_append_entries_args_for_given_server:: there is no log in state.persistent.log for prev_log_index: {}", prev_log_index))
                 .term;
 
         let append_entries_batch_size = self.config.append_entries_batch_size;
@@ -257,6 +257,7 @@ impl Raft {
             // If we were a leader we now revert to Follower so we need to stop our
             // hearbeat timer, if we are not Leader stopping heartbeat_timer 
             // does nothing
+            info!("Server: {} becomes a FOLLOWER after receiving msg with higher term", self.config.self_id);
             self.role = ServerType::Follower;
             // We must clear reply_channels when changing our role, since we don't 
             // want server that is not a leader to send msgs to clients.
@@ -324,7 +325,11 @@ impl Raft {
     async fn apply_commited_cmds_to_state_machine(&mut self)
     {
         let commit_index = self.state.volatile.commit_index;
-        debug!("Raft::apply_commited_cmds_to_state_machine:: Server: {} starts applying commands to state machine, commit_index: {}", self.config.self_id, commit_index);
+
+        if commit_index > self.state.volatile.last_applied
+        {
+            debug!("Server: {} starts applying commands to state machine, commit_index: {}, last_applied: {}", self.config.self_id, commit_index, self.state.volatile.last_applied);
+        }
 
         while commit_index > self.state.volatile.last_applied
         {
@@ -528,6 +533,13 @@ impl Handler<RaftMessage> for Raft
     async fn handle(&mut self, msg: RaftMessage) 
     {
         let header = &msg.header;
+        if !self.config.servers.contains(&header.source)
+        {
+            // We don't even have means to reply to such message since our 
+            // msg_sender won't have channel for such source, so we ignore it.
+            debug!("RaftMessage::handle:: Server: {} got msg with source: {} that is not present in config.servers, ignoring this msg", self.config.self_id, header.source);
+            return;
+        }
 
         match &msg.content
         {

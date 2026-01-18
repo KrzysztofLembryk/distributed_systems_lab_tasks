@@ -155,7 +155,7 @@ pub fn make_config(
     ServerConfig {
         self_id,
         election_timeout_range: singleton_range(election_timeout),
-        heartbeat_timeout: election_timeout / 5,
+        heartbeat_timeout: election_timeout / 5, // default
         servers: HashSet::from_iter(servers.to_owned()),
         append_entries_batch_size: BATCH_SIZE,
         snapshot_chunk_size: CHUNK_SIZE,

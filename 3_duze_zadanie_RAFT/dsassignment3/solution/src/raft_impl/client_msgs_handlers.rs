@@ -23,6 +23,7 @@ impl Raft
             ServerType::Leader => {
                 // We append every command, and only when committing we either skip
                 // this command or do other stuff
+                debug!("Leader: {} got Command", self.config.self_id);
                 let client_last_activity_timestamp = 
                     self.get_current_timestamp();
 

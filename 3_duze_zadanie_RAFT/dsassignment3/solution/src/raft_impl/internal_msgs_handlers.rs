@@ -30,13 +30,11 @@ impl Raft
             match &self.role
             {
                 ServerType::Follower => {
-                    debug!("Raft::handle_append_entries:: Follower: {} got appendEntries", self.config.self_id);
                     self.reset_election_timer().await;
                 },
                 ServerType::Candidate { .. } => {
                     // If we are Candidate and got AppendEntries from Leader that has
                     // 'term >= our_term' we revert back to Follower
-                    debug!("Raft::handle_append_entries:: Candidate: {} got appendEntries", self.config.self_id);
                     self.reset_election_timer().await;
                     self.role = ServerType::Follower;
                 },
@@ -62,14 +60,17 @@ impl Raft
 
             let prev_log_index = args.prev_log_index;
             let prev_log_term = args.prev_log_term;
-
+            
             if let Some(prev_entry) = self.state.persistent.log.get(prev_log_index)
             {
                 if prev_entry.term == prev_log_term
                 {
-                    debug!("Raft::handle_append_entries:: Server: '{}', has equal prevTerm to prevLogTerm: {}", self.config.self_id,prev_log_term);
-
-                    self.do_appending(args, prev_log_index).await;
+                    if !args.entries.is_empty()
+                    {
+                        debug!(" Follower: '{}' got AppendEntries, prevEntryTerm: {}, prevLogTerm: {}, will append: {} entries", self.config.self_id, prev_entry.term, prev_log_term, args.entries.len());
+                        // We do appending only if there is something to append
+                        self.do_appending(args, prev_log_index).await;
+                    }
 
                     response_msg = 
                         self.create_append_entries_response_msg(true, args);
@@ -77,7 +78,6 @@ impl Raft
                 else
                 {
                     // 2) We have entry at prevLogIdx but not with prevLogTerm
-                    debug!("Raft::handle_append_entries:: Server: '{}', has entry at prevLogIdx {} but not with prevLogTerm: {}", self.config.self_id , prev_log_index, prev_log_term);
                     response_msg = 
                         self.create_append_entries_response_msg(false, args);
                 }
@@ -85,7 +85,6 @@ impl Raft
             else
             {
                 // 1) We don't have entry at prevLogIndex
-                debug!("Raft::handle_append_entries:: Server: '{}', doesn't have entry at prevLogIndex: {}", self.config.self_id , prev_log_index);
                 response_msg =
                     self.create_append_entries_response_msg(false, args);
             }
@@ -123,8 +122,8 @@ impl Raft
                 }
                 else if self.config.self_id == header.source
                 {
-                    panic!("Raft::handle_append_entries_response:: Leader got response from server with source_id: '{}' which is LEADER's id,
-                    this should never happen, or sb is sending malicious msgs, we cannot operate further like that, PANIC", header.source);
+                    warn!("Raft::handle_append_entries_response:: Leader got response from server with source_id: '{}' which is LEADER's id,
+                    this should never happen, or sb is sending malicious msgs, we ignore", header.source);
                 }
                 else 
                 {
@@ -188,9 +187,15 @@ impl Raft
                         let next_index = self.state.volatile.leader_state.next_index
                                 .get_mut(&header.source)
                                 .unwrap();
-                        *next_index = next_index
-                            .checked_sub(1)
-                            .expect("Raft::handle_append_entries_response:: Response was FALSE, and in next_index.checked_sub(1) we got error, next_index must've been 0.");
+                        // We might get duplicate AppendEntriesResponse with false
+                        // and thus we might decrement too many times, so we 
+                        // decrement only if next_index > 1
+                        if *next_index > 1
+                        {
+                            *next_index = next_index
+                                .checked_sub(1)
+                                .expect("Raft::handle_append_entries_response:: Response was FALSE, and in next_index.checked_sub(1) we got error, next_index must've been 0.");
+                        }
 
                         // And we need to send next AppendEntries immediately.
                         // FALSE response means that we as LEADER will have some log 
@@ -341,6 +346,7 @@ impl Raft
 
             if last_hearing_timer.elapsed() >= *min_election_timeout
             {
+                debug!("Server: {}, enough time elapsed from hearing from Leader, can respond to RequestVote", self.config.self_id);
                 // We haven't received Heartbeat from Leader during minimal
                 // election timeout thus we can respond to RequestVote
                 self.check_for_higher_term(header.term).await;
@@ -366,6 +372,7 @@ impl Raft
                 }
                 _ => {
                     // Anyone else proceeds
+                    debug!("Server: {}, no timer for last hearing from Leader, can respond to RequestVote", self.config.self_id);
                     self.check_for_higher_term(header.term).await;
                     self.handle_request_vote(args, header).await;
                 }
@@ -379,6 +386,7 @@ impl Raft
         args: &RequestVoteResponseArgs
     )
     {
+        info!("Server: {} got RequestVoteResponse from {}", self.config.self_id, header.source);
         match &mut self.role 
         {
             ServerType::Follower => {
@@ -386,10 +394,9 @@ impl Raft
                 self.config.self_id, header.source);
             },
             ServerType::Candidate { votes_received } => {
+                info!("Candidate: {} got vote from {}. VoteGranted: {}", self.config.self_id, header.source, args.vote_granted);
                 if args.vote_granted
                 {
-                    info!("Candidate: '{}' got vote from: '{}'", self.config.self_id, header.source);
-
                     votes_received.insert(header.source);
 
                     // When we get majority we immediately become leader, reset timer and start our  leadership by sending heartbeats
