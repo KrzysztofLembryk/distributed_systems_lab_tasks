@@ -36,6 +36,18 @@ impl ExecutorSender {
     pub async fn fix_link(&self, from: Uuid, to: Uuid) {
         self.broken_links.lock().await.remove(&(from, to));
     }
+
+    pub async fn break_link_bidirectional(&self, from: Uuid, to: Uuid)
+    {
+        self.broken_links.lock().await.insert((from, to));
+        self.broken_links.lock().await.insert((to, from));
+    }
+
+    pub async fn fix_link_bidirectional(&self, from: Uuid, to: Uuid)
+    {
+        self.broken_links.lock().await.remove(&(from, to));
+        self.broken_links.lock().await.remove(&(to, from));
+    }
 }
 
 #[async_trait::async_trait]

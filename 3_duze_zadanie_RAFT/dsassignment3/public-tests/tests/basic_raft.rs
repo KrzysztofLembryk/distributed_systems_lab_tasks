@@ -1098,7 +1098,7 @@ async fn raftspy_checks_next_index_never_below_1_on_duplicated_false_append_entr
 
 #[tokio::test]
 #[timeout(2000)]
-async fn cluster_progresses_with_disruptive_candidate_partitioned() 
+async fn cluster_progresses_with_disruptive_candidate() 
 {
     // init_logger();
     let mut system = System::new().await;
@@ -1207,7 +1207,7 @@ async fn cluster_progresses_with_disruptive_candidate_partitioned()
 }
 
 #[tokio::test]
-// #[timeout(3000)]
+#[timeout(3000)]
 async fn disruptive_candidate_is_not_elected_after_partition_heal() 
 {
     init_logger();
