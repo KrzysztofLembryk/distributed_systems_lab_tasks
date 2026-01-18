@@ -945,9 +945,8 @@ async fn leader_ignores_message_from_unknown_source() {
 }
 
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-#[timeout(1000)]
+#[timeout(500)]
 async fn leader_handles_multiple_duplicated_false_append_entries_responses() {
-    init_logger();
     let mut system = System::new().await;
     let processes = make_idents();
     let [leader_id, follower_id] = processes;
@@ -992,7 +991,7 @@ async fn leader_handles_multiple_duplicated_false_append_entries_responses() {
     }
 
     // Simulate follower sending six duplicated old AppendEntriesResponse(false)
-    // we check if next_index - 1 doesn't underflow
+    // we check if next_index - 1 doesn't UNDERFLOW/PANIC
     for _ in 0..6 {
         leader
             .send(RaftMessage {
@@ -1035,9 +1034,72 @@ async fn leader_handles_multiple_duplicated_false_append_entries_responses() {
     system.shutdown().await;
 }
 
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+#[timeout(200)]
+async fn raftspy_checks_next_index_never_below_1_on_duplicated_false_append_entries_responses() {
+    let mut system = System::new().await;
+    let processes = make_idents();
+    let [leader_id, spy_id, _unused] = processes;
+    let (sender, [leader, follower], _) = make_standard_rafts::<IdentityMachine, RamStorage, _>(
+        &mut system,
+        [leader_id, spy_id],
+        [100, 300],
+        &processes,
+    )
+    .await;
+    sleep_ms(150).await;
+
+    // Attach RaftSpy to the follower (spy_id)
+    let (spy_sender, mut spy_receiver) = unbounded_channel();
+    sender
+        .insert(
+            spy_id,
+            Box::new(RaftSpy::new(&mut system, Some(follower.clone()), spy_sender).await),
+        )
+        .await;
+
+    // Register client 
+    let (result_sender, mut result_receiver) = unbounded_channel();
+    let client_id = register_client(&leader, &result_sender, &mut result_receiver).await;
+
+    // Simulate follower sending multiple duplicated AppendEntriesResponse(false)
+    for _ in 0..6 {
+        leader
+            .send(RaftMessage {
+                header: RaftMessageHeader {
+                    term: 1,
+                    source: spy_id,
+                },
+                content: RaftMessageContent::AppendEntriesResponse(AppendEntriesResponseArgs {
+                    success: false,
+                    last_verified_log_index: 0,
+                }),
+            })
+            .await;
+    }
+
+    sleep_ms(100).await;
+
+    // Check all AppendEntries sent to follower by the leader via the spy
+    while let Ok(msg) = spy_receiver.try_recv() {
+        if let RaftMessageContent::AppendEntries(args) = msg.content {
+            let next_index = args.prev_log_index + 1;
+            assert!(
+                // next_index max equal to 4 - Nop, RegisterClient, Command
+                next_index >= 1 && next_index <= 3,
+                "Leader sent AppendEntries with nextIndex below 1: {}",
+                next_index
+            );
+        }
+    }
+
+    system.shutdown().await;
+}
+
 #[tokio::test]
 #[timeout(2000)]
-async fn cluster_progresses_with_disruptive_leader_partitioned() {
+async fn cluster_progresses_with_disruptive_candidate_partitioned() 
+{
     // init_logger();
     let mut system = System::new().await;
 
@@ -1143,4 +1205,142 @@ async fn cluster_progresses_with_disruptive_leader_partitioned() {
 
     system.shutdown().await;
 }
+
+#[tokio::test]
+// #[timeout(3000)]
+async fn disruptive_candidate_is_not_elected_after_partition_heal() 
+{
+    init_logger();
+    let mut system = System::new().await;
+
+    let leader_id = 
+        Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
+    let follower1_id = 
+        Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+    let follower2_id = 
+        Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+    let disruptive_id = 
+        Uuid::parse_str("DDDDDDDD-DDDD-DDDD-DDDD-DDDDDDDDDDDD").unwrap();
+    let processes = [leader_id, follower1_id, follower2_id, disruptive_id];
+
+    let sender = ExecutorSender::default();
+    let boot = Instant::now();
+
+    // All servers join the cluster
+    let [leader, follower1, follower2, disruptive] = make_rafts(
+        &mut system,
+        [leader_id, follower1_id, follower2_id, disruptive_id],
+        [100, 200, 300, 100],
+        boot,
+        |_| Box::new(IdentityMachine),
+        |_| Box::<RamStorage>::default(),
+        sender.clone(),
+        async |id, mref| sender.insert(id, mref).await,
+        &processes,
+    )
+    .await;
+
+    // Partition: Disruptive server is isolated (cannot receive from anyone)
+    for &from in &[leader_id, follower1_id, follower2_id] {
+        sender.break_link(from, disruptive_id).await;
+    }
+
+    // Wait for elections to settle
+    sleep_ms(400).await;
+
+    // 1. Register client and send a command to the healthy cluster
+    let (result_sender, mut result_receiver) = unbounded_channel();
+    let client_id = register_client(&leader, &result_sender, &mut result_receiver).await;
+
+    // Command should succeed
+    leader
+        .send(ClientRequest {
+            reply_to: result_sender.clone(),
+            content: ClientRequestContent::Command {
+                command: vec![1, 2, 3],
+                client_id,
+                sequence_num: 0,
+                lowest_sequence_num_without_response: 0,
+            },
+        })
+        .await;
+    assert_eq!(
+        result_receiver.recv().await.unwrap(),
+        ClientRequestResponse::CommandResponse(CommandResponseArgs {
+            client_id,
+            sequence_num: 0,
+            content: CommandResponseContent::CommandApplied { output: vec![1, 2, 3] }
+        })
+    );
+
+    // 2. Partition the healthy leader (can't receive from followers and send to 
+    // them, so that his leadership ends faster)
+    for &from in &[follower1_id, follower2_id] {
+        sender.break_link(from, leader_id).await;
+        sender.break_link(leader_id, from).await;
+    }
+
+    // 3. Heal disruptive server's links to followers (but not to old leader)
+    for &from in &[follower1_id, follower2_id] {
+        sender.fix_link(from, disruptive_id).await;
+    }
+    // Wait for election to settle
+    sleep_ms(500).await;
+
+    // 5. Try to send a command to the disruptive server, should get NotLeader 
+    // since it doesnt have up-to-date log
+    let (disruptive_result_sender, mut disruptive_result_receiver) = unbounded_channel();
+    disruptive
+        .send(ClientRequest {
+            reply_to: disruptive_result_sender.clone(),
+            content: ClientRequestContent::RegisterClient,
+        })
+        .await;
+    
+    match disruptive_result_receiver.recv().await.unwrap()
+    {
+        ClientRequestResponse::RegisterClientResponse(
+            RegisterClientResponseArgs { 
+                content: RegisterClientResponseContent::NotLeader { .. }}) => {}
+        _ => {
+            panic!("disruptive didnt return NotLeader");
+        }
+    }
+
+    let (follower_result_sender, mut follower_result_receiver) = unbounded_channel();
+
+    // Only one of the followers can become a leader
+    follower1
+        .send(ClientRequest {
+            reply_to: follower_result_sender.clone(),
+            content: ClientRequestContent::RegisterClient,
+        })
+        .await;
+    follower2
+        .send(ClientRequest {
+            reply_to: follower_result_sender.clone(),
+            content: ClientRequestContent::RegisterClient,
+        })
+        .await;
+
+    // Wait for a response
+    let mut n_responses = 0;
+    while let Some(resp) = follower_result_receiver.recv().await {
+        n_responses += 1;
+        if matches!(
+            resp,
+            ClientRequestResponse::RegisterClientResponse(RegisterClientResponseArgs {
+                content: RegisterClientResponseContent::ClientRegistered { .. }
+            })
+        ) {
+            break;
+        }
+        if n_responses >= 2
+        {
+            panic!("Got {} responses, but none is ClientRegistered, so none has become a leader", n_responses);
+        }
+    }
+    system.shutdown().await;
+}
+
 

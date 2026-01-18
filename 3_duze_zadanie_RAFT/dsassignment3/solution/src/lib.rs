@@ -259,6 +259,7 @@ impl Raft {
             // does nothing
             info!("Server: {} becomes a FOLLOWER after receiving msg with higher term", self.config.self_id);
             self.role = ServerType::Follower;
+            self.state.volatile.last_hearing_from_leader_timer = None;
             // We must clear reply_channels when changing our role, since we don't 
             // want server that is not a leader to send msgs to clients.
             self.state.clear_reply_channels();

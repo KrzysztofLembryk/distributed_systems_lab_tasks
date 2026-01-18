@@ -44,7 +44,7 @@ impl Raft
                     // msgs to itself and from RAFT we know that there is only one 
                     // leader for given term at a time, thus this branch should be 
                     // NEVER invoked
-                    panic!("Raft::handle_append_entries:: Server which is Leader handles AppendEntries msg, this should never happen, source: {}, term: {}", header.source, header.term);
+                    panic!("handle_append_entries:: Server which is Leader handles AppendEntries msg, this should never happen, source: {}, term: {}", header.source, header.term);
                 }
             }
 
@@ -298,23 +298,23 @@ impl Raft
 
                     if vote_granted
                     {
-                        info!("Follower: '{}' votes for: '{}'", self.config.self_id, candidate_id);
+                        info!("Follower: '{}' grants vote for: '{}'", self.config.self_id, candidate_id);
                         self.state.persistent.voted_for = Some(candidate_id);
                         self.save_to_stable_storage().await;
+                        // We do not reset last_hearing_timer since this msg is from 
+                        // Candidate not from Leader
+                        // We reset ElectionTimer to give this candidate time to 
+                        // gather votes, since we voted for him
+                        self.reset_election_timer().await;
                     }
 
                     response_args = RequestVoteResponseArgs { vote_granted };
-
-                    // We do not reset last_hearing_timer since this msg is from 
-                    // Candidate not from Leader
-                    // We reset ElectionTimer to give this candidate time to gather 
-                    // votes
-                    self.reset_election_timer().await;
                 }
             },
             ServerType::Candidate { .. } => {
                 // From visualisation recommended in previous RAFT task description
                 // we can see that candidate rejects other candidates requests
+                // since they already voted fo themselves
                 response_args = RequestVoteResponseArgs { 
                     vote_granted: false
                 };
@@ -346,7 +346,6 @@ impl Raft
 
             if last_hearing_timer.elapsed() >= *min_election_timeout
             {
-                debug!("Server: {}, enough time elapsed from hearing from Leader, can respond to RequestVote", self.config.self_id);
                 // We haven't received Heartbeat from Leader during minimal
                 // election timeout thus we can respond to RequestVote
                 self.check_for_higher_term(header.term).await;
@@ -357,7 +356,7 @@ impl Raft
                 // Not enough time since last Leader's heartbeat has elapsed
                 // for us to respond to RequestVote, 
                 // so we IGNORE IT and DON'T UPDATE OUR TERM etc.
-                debug!("Server: '{}' got RequestVote from: '{}', but minimal election timeout from hearing heartbeat from leader hasn't passed, thus IGNORING this msg", self.config.self_id, header.source);
+                debug!("Follower: '{}' got RequestVote from: '{}', but minimal election timeout from hearing heartbeat from leader hasn't passed, thus IGNORING this msg", self.config.self_id, header.source);
             }
         }
         else
@@ -372,7 +371,6 @@ impl Raft
                 }
                 _ => {
                     // Anyone else proceeds
-                    debug!("Server: {}, no timer for last hearing from Leader, can respond to RequestVote", self.config.self_id);
                     self.check_for_higher_term(header.term).await;
                     self.handle_request_vote(args, header).await;
                 }
@@ -386,7 +384,6 @@ impl Raft
         args: &RequestVoteResponseArgs
     )
     {
-        info!("Server: {} got RequestVoteResponse from {}", self.config.self_id, header.source);
         match &mut self.role 
         {
             ServerType::Follower => {
