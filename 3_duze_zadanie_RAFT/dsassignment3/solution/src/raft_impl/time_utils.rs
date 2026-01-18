@@ -162,7 +162,6 @@ impl Handler<ElectionTimeout> for Raft
                     // election timeout thus we revert back to Follower
                     self.role = ServerType::Follower;
                     self.state.volatile.leader_id = None;
-                    self.state.clear_reply_channels();
                     self.stop_heartbeat_timer().await;
                     self.reset_election_timer().await;
                 }

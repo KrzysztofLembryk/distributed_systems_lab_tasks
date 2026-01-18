@@ -2,7 +2,7 @@ use module_system::{Handler, ModuleRef, System, TimerHandle};
 use other_raft_structs::{ServerType, ServerState, PersistentState};
 use uuid::Uuid;
 use std::collections::{HashMap};
-use log::{debug, warn, info};
+use log::{debug, info};
 
 pub use domain::*;
 use crate::types_defs::{IndexT, ServerIdT, TermT};
@@ -260,9 +260,6 @@ impl Raft {
             info!("Server: {} becomes a FOLLOWER after receiving msg with higher term", self.config.self_id);
             self.role = ServerType::Follower;
             self.state.volatile.last_hearing_from_leader_timer = None;
-            // We must clear reply_channels when changing our role, since we don't 
-            // want server that is not a leader to send msgs to clients.
-            self.state.clear_reply_channels();
             self.stop_heartbeat_timer().await;
             self.update_term(new_term).await;
         }
@@ -384,7 +381,7 @@ impl Raft {
                                 // This way we would ensure that no other server 
                                 // replies to clients (we always clear reply_channels variable when leader is stepping down, but this way we would be even more sure, and less bug prone)
                                 self.state.volatile.leader_state
-                                    .reply_to_client(curr_cmd_index, response);
+                                    .reply_to_client(curr_cmd_index, response, &self.role);
                             },
                             ClientCmdState::AlreadyDiscarded 
                             | ClientCmdState::WrongLowestSeqNumVal => {
@@ -412,7 +409,7 @@ impl Raft {
                                 let response = ClientRequestResponse
                                     ::CommandResponse(args);
                                 self.state.volatile.leader_state
-                                    .reply_to_client(curr_cmd_index, response);
+                                    .reply_to_client(curr_cmd_index, response, &self.role);
                             }
                             ClientCmdState::CmdResultAlreadyPresent(res_data) => {
                                 // Even though result is present this command is 
@@ -442,7 +439,7 @@ impl Raft {
                                             content 
                                 });
                                 self.state.volatile.leader_state
-                                    .reply_to_client(curr_cmd_index, response);
+                                    .reply_to_client(curr_cmd_index, response, &self.role);
                             }
                             ClientCmdState::CanBeApplied => {
                                 let result = self.state_machine.apply(data).await;
@@ -467,7 +464,7 @@ impl Raft {
                                             content 
                                 });
                                 self.state.volatile.leader_state
-                                    .reply_to_client(curr_cmd_index, response);
+                                    .reply_to_client(curr_cmd_index, response, &self.role);
                             },
                         }
                     },
@@ -498,7 +495,8 @@ impl Raft {
                                                 client_id 
                                             }
                                         }
-                                    )
+                                    ),
+                                    &self.role
                                 );
                             },
                             _ => {
@@ -538,7 +536,7 @@ impl Handler<RaftMessage> for Raft
         {
             // We don't even have means to reply to such message since our 
             // msg_sender won't have channel for such source, so we ignore it.
-            debug!("RaftMessage::handle:: Server: {} got msg with source: {} that is not present in config.servers, ignoring this msg", self.config.self_id, header.source);
+            info!("Server: {} got msg with source: {} that is not present in config.servers, ignoring this msg", self.config.self_id, header.source);
             return;
         }
 
@@ -560,11 +558,11 @@ impl Handler<RaftMessage> for Raft
                 self.check_for_higher_term(header.term).await;
                 self.handle_request_vote_response(header, response_args).await;
             },
-            RaftMessageContent::InstallSnapshot(args) => {
-
+            RaftMessageContent::InstallSnapshot(..) => {
+                unimplemented!("Snapshots omitted")
             },
-            RaftMessageContent::InstallSnapshotResponse(response_args) => {
-
+            RaftMessageContent::InstallSnapshotResponse(..) => {
+                unimplemented!("Snapshots omitted")
             }
         }
     }

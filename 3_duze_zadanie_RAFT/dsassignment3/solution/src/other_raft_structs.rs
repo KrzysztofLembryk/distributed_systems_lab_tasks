@@ -13,14 +13,6 @@ pub struct ServerState
     pub volatile: VolatileState
 }
 
-impl ServerState
-{
-    pub fn clear_reply_channels(&mut self)
-    {
-        self.volatile.leader_state.reply_channels.clear();
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 pub struct PersistentState
 {
@@ -350,10 +342,6 @@ impl VolatileLeaderState
             self.next_index.insert(*server_id, next_index_val);
             self.match_index.insert(*server_id, 0);
         }
-        // We must clear reply_channels both here and WHEN STEPPING DOWN AS LEADER
-        // since if we don't do that someone who is NOT A LEADER may send msg to 
-        // client, we don't want that!!!!!
-        self.reply_channels.clear();
     }
 
     pub fn insert_reply_channel(
@@ -370,17 +358,22 @@ impl VolatileLeaderState
     pub fn reply_to_client(
         &mut self,
         command_index: IndexT,
-        response: ClientRequestResponse
+        response: ClientRequestResponse,
+        role: &ServerType
     )
     {
-        if let Some(reply_to) = self.reply_channels.remove(&command_index)
+        match role
         {
-            let _ = reply_to.send(response); 
+            ServerType::Leader => {
+                if let Some(reply_to) = self.reply_channels.remove(&command_index)
+                {
+                    let _ = reply_to.send(response); 
+                }
+            }
+            _ => {
+                // do nothing since we are not a leader
+            }
         }
-        // Otherwise we do nothing, if leader doesn't have reply_to channel it must 
-        // mean that leader has changed, and new leader has just committed old 
-        // leader's entry, and new leader doesn't know client's channels.
-        // Or if we are not a leader at all we don't reply
     }
 
 }

@@ -1,6 +1,6 @@
 use uuid::Uuid;
 use tokio::sync::mpsc::UnboundedSender;
-use log::{debug};
+use log::{info};
 
 use crate::domain::*;
 use crate::{Raft};
@@ -23,7 +23,6 @@ impl Raft
             ServerType::Leader => {
                 // We append every command, and only when committing we either skip
                 // this command or do other stuff
-                debug!("Leader: {} got Command", self.config.self_id);
                 let client_last_activity_timestamp = 
                     self.get_current_timestamp();
 
@@ -80,7 +79,7 @@ impl Raft
         match self.role
         {
             ServerType::Leader => {
-                debug!("Leader: {} got RegisterClient", self.config.self_id);
+                info!("Leader: {} got RegisterClient", self.config.self_id);
                 let log_content = LogEntryContent::RegisterClient; 
                 let log_entry = LogEntry {
                     content: log_content,
@@ -119,16 +118,7 @@ impl Raft
         &mut self
     )
     {
-        match self.role
-        {
-            ServerType::Leader => {
-                unimplemented!("Leader - handling Client Snapshot request not implemented");
-            },
-            _ => {
-
-                unimplemented!("Follower/Candidate - handling Client Snapshot request not implemented");
-            }
-        }
+        unimplemented!("Snapshots omitted")
     }
 
     pub async fn handle_client_add_server(
@@ -137,24 +127,7 @@ impl Raft
         reply_to: UnboundedSender<ClientRequestResponse>
     )
     {
-        match self.role
-        {
-            ServerType::Leader => {
-                unimplemented!("Handler<ClientRequest>:: Leader - AddServer unimplemented");
-            },
-            _ => {
-                let args = AddServerResponseArgs {
-                    new_server,
-                    content: AddServerResponseContent::NotLeader {  
-                        leader_hint: self.state.volatile.leader_id.clone()
-                    }
-                };
-                let response = 
-                    ClientRequestResponse::AddServerResponse(args);
-
-                let _ = reply_to.send(response);
-            }
-        }
+        unimplemented!("Cluster membership changes omitted");
     }
 
     pub async fn handle_client_remove_server(
@@ -163,25 +136,7 @@ impl Raft
         reply_to: UnboundedSender<ClientRequestResponse>
     )
     {
-        match self.role
-        {
-            ServerType::Leader => {
-                unimplemented!("Handler<ClientRequest>:: Leader - RemoveServer unimplemented");
-            },
-            _ => {
-                let args = RemoveServerResponseArgs {
-                    old_server,
-                    content: RemoveServerResponseContent::NotLeader { 
-                        leader_hint: self.state.volatile.leader_id.clone()
-                    }
-                };
-
-                let response = 
-                    ClientRequestResponse::RemoveServerResponse(args);
-
-                let _ = reply_to.send(response);
-            }
-        }
+        unimplemented!("Cluster membership changes omitted");
     }
 
 }
