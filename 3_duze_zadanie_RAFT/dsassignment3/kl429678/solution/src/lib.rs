@@ -43,7 +43,6 @@ impl Raft {
     ) -> ModuleRef<Self> 
     {
         debug!("Raft::new:: creating server: {}", config.self_id);
-        let mut state_machine = state_machine;
         let volatile_state: VolatileState = 
             VolatileState::new(&config.servers);
         let persistent_state: PersistentState;
@@ -52,11 +51,6 @@ impl Raft {
             stable_storage.get(&config.self_id.to_string()).await
         {
             persistent_state = decode_from_slice(&retrieved_state).unwrap();
-            recover_state_machine(
-                &persistent_state, 
-                &mut state_machine,
-                volatile_state.last_applied
-            ).await;
         }
         else
         {
@@ -608,36 +602,6 @@ impl Handler<ClientRequest> for Raft
 }
 
 // TODO you can implement handlers of messages of other types for the Raft struct.
-
-async fn recover_state_machine(
-    persistent_state: &PersistentState, 
-    state_machine: &mut Box<dyn StateMachine>,
-    last_applied_idx: IndexT
-)
-{
-    // When recovering we are FOLLOWER
-    // Since state machine is volatile it must be recovered after restart by
-    // reapplying log entries (after applying latest snapshot)
-    for (idx, cmd) in persistent_state.log.iter().enumerate()
-    {
-        // We reapply log entries only till the last_applied_idx we got from snapshot
-        if idx > last_applied_idx
-        {
-            break;
-        }
-        match &cmd.content
-        {
-            LogEntryContent::Command { data, .. } => {
-                // TODO: here we need also to CREATE SESSIONS, add entries etc
-                // we probably should just invoke here apply_commited_cmds_to_state_machine
-                let _ = state_machine.apply(data).await;
-            },
-            _ => {
-                // we apply only Command Log to our state machine
-            }
-        }
-    }
-}
 
 // TODO: test this function
 fn find_new_commit_index(
