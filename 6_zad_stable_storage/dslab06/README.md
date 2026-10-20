@@ -72,6 +72,45 @@ In the lab, we assumed correctness of the system primitives. However, the practi
     Linux Kernel documentation on block device data integrity written in 2007.
     Files are fraught with peril: a transcript of a talk covering overall guaranteed persistence.
 
+# Links
+<p>Observe that databases are an excellent example of systems requiring
+stable storage: after a transaction is committed, the modified data are
+expected to be stored reliably despite any software and hardware
+failures. One of the techniques used by databases to provide stable
+storage for complex data is a <strong>Write Ahead Log (WAL)</strong>.
+You can read more about it in a <a href="https://medium.com/@daniel.chia/writing-a-database-part-2-write-ahead-log-2463f5cec67a">blog
+post</a> by Daniel Chia. The concept of using a log to guarantee
+reliable data operations is used also in <strong>journaling
+filesystems</strong>. You can read about them in this <a href="https://en.wikipedia.org/wiki/Journaling_file_system">Wikipedia
+article</a>. In general, <a href="https://en.wikipedia.org/wiki/Append-only">append-only data
+structures</a> are easier to implement safely. However, in order to
+prevent the data storage from growing uncontrollably, an atomic
+compaction operation is required.</p>
+<p>If you wonder how many bugs can be present in a popular filesystem
+implementation, we recommend reading the <a href="http://pages.cs.wisc.edu/~ll/papers/fsstudy-tos.pdf">A Study of
+Linux File System Evolution</a> paper by L. Lu et al., in which the
+authors examine over 5000 patches from six major filesystems available
+in Linux.</p>
+<p>In the lab, we assumed correctness of the system primitives. However,
+the practical world is full of corner cases and underspecified behavior.
+For instance, a hard drive is some configurations may lie about storing
+the transfer in non-volatile memory, while keeping them in an internal
+battery-powered buffer. On the other hand, most of the popular
+filesystems trust the disk for verifying data integrity against
+corruption, but these checksums are relatively weak. You may find these
+links useful to deepen your knowledge:</p>
+<ul>
+<li><a href="https://wiki.postgresql.org/wiki/Fsync_Errors">PostgreSQL
+fsyncgate 2018</a>: can an application not notice a write failure?</li>
+<li><a href="https://www.usenix.org/system/files/atc20-rebello.pdf">Can
+Applications Recover from fsync Failures?</a>: a research paper
+analyzing various filesystems and applications.</li>
+<li>Linux Kernel documentation on <a href="https://www.kernel.org/doc/Documentation/block/data-integrity.txt">block
+device data integrity</a> written in 2007.</li>
+<li><a href="https://danluu.com/deconstruct-files/">Files are fraught
+with peril</a>: a transcript of a talk covering overall guaranteed
+persistence.</li>
+</ul>
 
 ```rust
 // Source - https://stackoverflow.com/a
